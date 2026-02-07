@@ -1,5 +1,8 @@
 use crate::descriptor::VectorKind;
 use crate::intrinsic::Intrinsic;
+use crate::transforms::{
+    has_local_exception_tags, threads as threads_xform, unstart_start_function,
+};
 use crate::wit::{
     Adapter, AdapterId, AdapterJsImportKind, AuxExportedMethodKind, AuxReceiverKind, AuxStringEnum,
     AuxValue,
@@ -7,26 +10,40 @@ use crate::wit::{
 use crate::wit::{AdapterKind, Instruction, InstructionData};
 use crate::wit::{AuxEnum, AuxExport, AuxExportKind, AuxImport, AuxStruct};
 use crate::wit::{JsImport, JsImportName, NonstandardWitSection, WasmBindgenAux};
-use crate::{reset_indentation, Bindgen, EncodeInto, OutputMode, PLACEHOLDER_MODULE};
+use crate::{Bindgen, EncodeInto, OutputMode, PLACEHOLDER_MODULE};
 use anyhow::{anyhow, bail, Context as _, Error};
 use binding::TsReference;
 use std::borrow::Cow;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::{fmt, mem};
 use walrus::{FunctionId, ImportId, MemoryId, Module, TableId, ValType};
-use wasm_bindgen_shared::identifier::is_valid_ident;
+use wasm_bindgen_shared::escape_string;
+use wasm_bindgen_shared::identifier::{is_valid_ident, to_valid_ident};
 
 mod binding;
 
+macro_rules! region {
+    ($ctx:expr, $name:literal, $code:block) => {
+        if $ctx.config.debug {
+            $ctx.globals.push_str(concat!("\n//#region ", $name, "\n"));
+        }
+        $code
+        if $ctx.config.debug {
+            $ctx.globals.push_str("\n//#endregion\n");
+        }
+    };
+}
+
 pub struct Context<'a> {
     globals: String,
+    intrinsics: Option<BTreeMap<Cow<'static, str>, Cow<'static, str>>>,
     imports_post: String,
+    export_name_list: Vec<String>,
     typescript: String,
-    exposed_globals: Option<HashSet<Cow<'static, str>>>,
-    next_export_idx: usize,
     config: &'a Bindgen,
     pub module: &'a mut Module,
     aux: &'a WasmBindgenAux,
@@ -60,7 +77,10 @@ pub struct Context<'a> {
     /// require the type or requires only the type.
     used_string_enums: HashSet<String>,
 
-    exported_classes: Option<BTreeMap<String, ExportedClass>>,
+    exported_classes: BTreeMap<String, ExportedClass>,
+
+    /// Public module exports
+    exports: BTreeMap<String, ExportEntry>,
 
     /// A map of the name of npm dependencies we've loaded so far to the path
     /// they're defined in as well as their version specification.
@@ -79,16 +99,54 @@ pub struct Context<'a> {
 
     /// If threading is enabled.
     threads_enabled: bool,
+
+    /// If exception handling / unwinding is enabled.
+    unwind_enabled: bool,
+}
+
+/// Definition of a module export
+enum ExportEntry {
+    /// Any export definition
+    Definition(ExportDefinition),
+    /// Namespace export
+    Namespace(ExportedNamespace),
+}
+
+struct ExportDefinition {
+    /// The identifier for the declaration, if distinct from the export name
+    /// This allows invalid identifier export names (like "default").
+    identifier: String,
+
+    comments: Option<String>,
+    definition: String,
+
+    ts_comments: Option<String>,
+    ts_definition: String,
+
+    /// Whether this is a private export, so not actually exposed on the module exports interface
+    private: bool,
+}
+
+/// Module namespace export
+#[derive(Default)]
+struct ExportedNamespace {
+    /// Namespace id.
+    id: Option<String>,
+    /// Namespace entries.
+    ns: BTreeMap<String, ExportEntry>,
 }
 
 #[derive(Default)]
 struct ExportedClass {
     comments: String,
     contents: String,
+    identifier: String,
     /// The TypeScript for the class's methods.
     typescript: String,
     /// Whether TypeScript for this class should be emitted (i.e., `skip_typescript` wasn't specified).
     generate_typescript: bool,
+    /// Whether to skip exporting this class from the module exports
+    private: bool,
     has_constructor: bool,
     wrap_needed: bool,
     unwrap_needed: bool,
@@ -98,6 +156,8 @@ struct ExportedClass {
     readable_properties: Vec<String>,
     /// Map from field to information about those fields
     typescript_fields: HashMap<FieldLocation, FieldInfo>,
+    /// The namespace to export the class through, if any
+    js_namespace: Option<Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,18 +181,6 @@ struct FieldAccessor {
     is_optional: bool,
 }
 
-/// Different JS constructs that can be exported.
-enum ExportJs<'a> {
-    /// A class of the form `class Name {...}`.
-    Class(&'a str),
-    /// An anonymous function expression of the form `function(...) {...}`.
-    ///
-    /// Note that the function name is not included in the string.
-    Function(&'a str),
-    /// An arbitrary JS expression.
-    Expression(&'a str),
-}
-
 const INITIAL_HEAP_VALUES: &[&str] = &["undefined", "null", "true", "false"];
 // Must be kept in sync with `src/lib.rs` of the `wasm-bindgen` crate
 const INITIAL_HEAP_OFFSET: usize = 128;
@@ -146,21 +194,23 @@ impl<'a> Context<'a> {
     ) -> Result<Context<'a>, Error> {
         Ok(Context {
             globals: String::new(),
+            intrinsics: Some(Default::default()),
             imports_post: String::new(),
+            export_name_list: Vec::new(),
             typescript: "/* tslint:disable */\n/* eslint-disable */\n".to_string(),
-            exposed_globals: Some(Default::default()),
             imported_names: Default::default(),
             js_imports: Default::default(),
             defined_identifiers: Default::default(),
             wasm_import_definitions: Default::default(),
             typescript_refs: Default::default(),
             used_string_enums: Default::default(),
-            exported_classes: Some(Default::default()),
+            exported_classes: Default::default(),
+            exports: Default::default(),
             config,
-            threads_enabled: wasm_bindgen_threads_xform::is_enabled(module),
+            threads_enabled: threads_xform::is_enabled(module),
+            unwind_enabled: has_local_exception_tags(module),
             module,
             npm_dependencies: Default::default(),
-            next_export_idx: 0,
             wit,
             aux,
             memories: Default::default(),
@@ -169,69 +219,101 @@ impl<'a> Context<'a> {
         })
     }
 
-    fn should_write_global(&mut self, name: impl Into<Cow<'static, str>>) -> bool {
-        self.exposed_globals.as_mut().unwrap().insert(name.into())
+    fn has_intrinsic(&self, name: &str) -> bool {
+        self.intrinsics.as_ref().unwrap().contains_key(name)
     }
 
-    fn export(
-        &mut self,
-        export_name: &str,
-        export: ExportJs,
-        comments: Option<&str>,
-    ) -> Result<(), Error> {
-        let definition_name = self.generate_identifier(export_name);
-        if matches!(export, ExportJs::Class(_)) && definition_name != export_name {
-            bail!("cannot shadow already defined class `{}`", export_name);
+    /// Writes an ExportDefinition to global and typescript buffers.
+    /// Handles realising for invalid identifier export names.
+    /// define_only used when only locally declared but not explicitly exported.
+    fn export_def(&mut self, export_name: Option<&str>, def: &ExportDefinition) {
+        let ExportDefinition {
+            definition: decl,
+            ts_definition: ts_decl,
+            identifier: id,
+            comments,
+            ts_comments,
+            private,
+        } = def;
+        self.globals.push('\n');
+        if self.config.typescript && !ts_decl.is_empty() {
+            self.typescript.push('\n');
         }
-
-        // write out comments
-        if let Some(c) = comments {
+        // Unless it is `export ...declaration...` form (common case), write the declaration first
+        // and then export.
+        if export_name.map(|name| name != id).unwrap_or(true)
+            || matches!(
+                self.config.mode,
+                OutputMode::Node { module: false } | OutputMode::NoModules { .. }
+            )
+            || *private
+        {
+            if let Some(c) = comments {
+                self.globals.push_str(c);
+            }
+            self.globals.push_str(decl);
+        } else if let Some(c) = comments {
             self.globals.push_str(c);
         }
-
-        let global = match self.config.mode {
-            OutputMode::Node { module: false } => match export {
-                ExportJs::Class(class) => {
-                    format!("{class}\nmodule.exports.{export_name} = {export_name};\n")
+        if self.config.typescript && !ts_decl.is_empty() {
+            if export_name.map(|name| name != id).unwrap_or(true) || *private {
+                if let Some(c) = ts_comments {
+                    self.typescript.push_str(c);
                 }
-                ExportJs::Function(expr) | ExportJs::Expression(expr) => {
-                    format!("module.exports.{export_name} = {expr};\n")
+                // in nomodules, we output into a namespace, which is already ambient
+                if !self.config.mode.no_modules() {
+                    self.typescript.push_str("declare ");
                 }
-            },
-            OutputMode::NoModules { .. } => match export {
-                ExportJs::Class(class) => {
-                    format!("{class}\n__exports.{export_name} = {export_name};\n")
-                }
-                ExportJs::Function(expr) | ExportJs::Expression(expr) => {
-                    format!("__exports.{export_name} = {expr};\n")
-                }
-            },
-            OutputMode::Bundler { .. }
-            | OutputMode::Node { module: true }
-            | OutputMode::Web
-            | OutputMode::Deno => match export {
-                ExportJs::Class(class) => {
-                    assert_eq!(export_name, definition_name);
-                    format!("export {class}\n")
-                }
-                ExportJs::Function(function) => {
-                    let body = function.strip_prefix("function").unwrap();
-                    if export_name == definition_name {
-                        format!("export function {export_name}{body}\n")
+                self.typescript.push_str(ts_decl);
+            } else if let Some(c) = ts_comments {
+                self.typescript.push_str(c);
+            }
+        }
+        if *private {
+            return;
+        }
+        if let Some(export_name) = export_name {
+            match self.config.mode {
+                OutputMode::Node { module: false } | OutputMode::NoModules { .. } => self
+                    .globals
+                    .push_str(&format!("exports.{export_name} = {id};\n")),
+                OutputMode::Bundler { .. }
+                | OutputMode::Node { module: true }
+                | OutputMode::Web
+                | OutputMode::Module
+                | OutputMode::Deno => {
+                    if export_name == id {
+                        if !decl.is_empty() {
+                            self.globals.push_str(&format!("export {decl}"));
+                        } else {
+                            // reexport case
+                            self.globals.push_str(&format!("export {{ {id} }}\n"));
+                        }
+                    } else if is_valid_ident(export_name) {
+                        self.globals
+                            .push_str(&format!("export {{ {id} as {export_name} }}\n"));
                     } else {
-                        format!(
-                            "function {definition_name}{body}\nexport {{ {definition_name} as {export_name} }};\n",
-                        )
+                        self.globals
+                            .push_str(&format!("export {{ {id} as '{export_name}' }}\n"));
                     }
                 }
-                ExportJs::Expression(expr) => {
-                    assert_eq!(export_name, definition_name);
-                    format!("export const {export_name} = {expr};\n")
+            };
+            if self.config.typescript && !ts_decl.is_empty() {
+                if export_name == "default" {
+                    self.typescript.push_str(&format!("export default {id};\n"));
+                } else if export_name == id {
+                    if !ts_decl.is_empty() {
+                        self.typescript.push_str(&format!("export {ts_decl}"));
+                    }
+                } else if is_valid_ident(export_name) {
+                    self.typescript
+                        .push_str(&format!("export {{ {id} as {export_name} }}\n"));
+                } else {
+                    self.typescript
+                        .push_str(&format!("// export {{ {id} as '{export_name}' }}\n"));
                 }
-            },
-        };
-        self.global(&global);
-        Ok(())
+            }
+        }
     }
 
     pub fn finalize(
@@ -243,154 +325,201 @@ impl<'a> Context<'a> {
         // `__wrap` and such.
         self.write_classes()?;
 
+        // Process reexports
+        for (export_name, js_import) in self.aux.reexports.clone() {
+            let import_name = self.import_name(&js_import)?;
+            let ts_definition = format!("let {import_name}: unknown;\n");
+            define_export(
+                &mut self.exports,
+                &export_name,
+                &[],
+                ExportEntry::Definition(ExportDefinition {
+                    identifier: import_name,
+                    comments: None,
+                    definition: "".to_string(),
+                    ts_comments: None,
+                    ts_definition,
+                    private: false,
+                }),
+            )?;
+        }
+
+        let body = std::mem::take(&mut self.globals);
+        let body = body.trim();
+
+        if self.config.typescript && !self.config.mode.no_modules() && !self.config.mode.bundler() {
+            // jsr-self-types directive
+            let directive = format!("/* @ts-self-types=\"./{module_name}.d.ts\" */\n");
+            self.globals.push_str(&directive);
+        }
+
+        if !self.js_imports.is_empty() {
+            region!(self, "js imports", {
+                let imports = self.js_import_header()?;
+                self.globals.push_str(&imports);
+            });
+        }
+
+        if !self.exports.is_empty() {
+            // Write out all exports
+            region!(self, "exports", {
+                self.write_exports()?;
+            });
+        }
+
+        if let Some(mem) = self.module.memories.iter().next() {
+            if let Some(id) = mem.import {
+                self.module.imports.get_mut(id).module = PLACEHOLDER_MODULE.to_owned();
+                let mut init_memory = "new WebAssembly.Memory({".to_string();
+                init_memory.push_str(&format!("initial:{}", mem.initial));
+                if let Some(max) = mem.maximum {
+                    init_memory.push_str(&format!(",maximum:{max}"));
+                }
+                if mem.shared {
+                    init_memory.push_str(",shared:true");
+                }
+                init_memory.push_str("})");
+                self.wasm_import_definitions.insert(id, init_memory);
+            }
+        }
+
+        let mut has_memory = false;
+        if let Some(mem) = self.module.memories.iter().next() {
+            if let Some(id) = mem.import {
+                if let Some(def) = self.wasm_import_definitions.get_mut(&id) {
+                    if !self.config.mode.bundler() {
+                        def.insert_str(0, "memory || ");
+                    }
+                    has_memory = true;
+                }
+            }
+        }
+
+        region!(self, "wasm imports", {
+            let imports = self.generate_imports(module_name, has_memory);
+            self.globals.push_str(&imports);
+        });
+
+        let imports_post = std::mem::take(&mut self.imports_post);
+        let imports_post = imports_post.trim();
+
+        if !imports_post.is_empty() {
+            self.globals.push_str(imports_post);
+            self.globals.push('\n');
+        }
+        if !body.is_empty() {
+            self.globals.push_str(body);
+            self.globals.push_str("\n\n");
+        }
+
+        let intrinsics = self.intrinsics.take().unwrap();
+        if !intrinsics.is_empty() {
+            region!(self, "intrinsics", {
+                for code in intrinsics.values() {
+                    self.globals.push_str(code.trim());
+                    self.globals.push_str("\n\n");
+                }
+            });
+        }
+
         // Initialization is just flat out tricky and not something we
         // understand super well. To try to handle various issues that have come
         // up we always remove the `start` function if one is present. The JS
         // bindings glue then manually calls the start function (if it was
         // previously present).
-        let needs_manual_start = self.unstart_start_function();
+        let needs_manual_start = unstart_start_function(self.module);
+        region!(self, "wasm loading", {
+            let wasm_loading =
+                self.generate_wasm_loading(module_name, needs_manual_start, has_memory);
+            self.globals.push_str(&wasm_loading);
+        });
 
-        // Cause any future calls to `should_write_global` to panic, making sure
-        // we don't ask for items which we can no longer emit.
-        drop(self.exposed_globals.take().unwrap());
+        let mut start = self
+            .config
+            .mode
+            .bundler()
+            .then(|| self.generate_bundler_start(module_name, needs_manual_start));
 
-        self.finalize_js(module_name, needs_manual_start)
-    }
+        if let Some(start) = &mut start {
+            mem::swap(&mut self.globals, start);
+        }
 
-    fn generate_node_imports(&self) -> String {
-        let mut imports = BTreeSet::new();
-        for import in self
-            .module
-            .imports
-            .iter()
-            .filter(|i| !(matches!(i.kind, walrus::ImportKind::Memory(_))))
+        if self.config.debug {
+            if self.config.mode.uses_es_modules() {
+                self.globals.push_str("export { wasm as __wasm }");
+            } else {
+                self.globals.push_str("exports.__wasm = wasm;");
+            }
+        }
+
+        let mut ts = String::new();
+
+        if self.config.mode.no_modules() {
+            let mut iife = "
+            let wasm_bindgen = (function(exports) {
+            let script_src;
+            if (typeof document !== 'undefined' && document.currentScript !== null) {
+                script_src = new URL(document.currentScript.src, location.href).toString();
+            }
+            "
+            .to_owned();
+            iife.push_str(&self.globals);
+            iife.push_str(
+                "
+                return Object.assign(__wbg_init, { initSync }, exports);
+                })({ __proto__: null });
+                ",
+            );
+            self.globals = iife;
+            ts = String::from("declare namespace wasm_bindgen {\n");
+            ts.push_str(&self.typescript);
+            ts.push_str("\n}");
+        } else {
+            ts.push_str(&self.typescript);
+        }
+
+        // Generate TypeScript definitions for init functions in web and no-modules modes
+        if self.config.typescript
+            && matches!(
+                self.config.mode,
+                OutputMode::Web | OutputMode::NoModules { .. }
+            )
         {
-            imports.insert(&import.module);
+            let has_module_or_path_optional = !self.config.omit_default_module_path;
+            let init_ts = self.ts_for_init_fn(has_memory, has_module_or_path_optional)?;
+            ts.push_str(&init_ts);
         }
 
-        let mut shim = String::new();
-
-        shim.push_str("\nlet imports = {};\n");
-
-        if self.config.mode.uses_es_modules() {
-            for (i, module) in imports.iter().enumerate() {
-                if module.as_str() != PLACEHOLDER_MODULE {
-                    shim.push_str(&format!("import * as import{i} from '{module}';\n"));
-                }
-            }
-            for (i, module) in imports.iter().enumerate() {
-                if module.as_str() != PLACEHOLDER_MODULE {
-                    shim.push_str(&format!("imports['{module}'] = import{i};\n"));
-                }
-            }
-        } else {
-            for module in imports.iter() {
-                if module.as_str() == PLACEHOLDER_MODULE {
-                    shim.push_str(&format!(
-                        "imports['{PLACEHOLDER_MODULE}'] = module.exports;\n"
-                    ));
-                } else {
-                    shim.push_str(&format!("imports['{module}'] = require('{module}');\n"));
-                }
-            }
+        // Generate TypeScript definitions for Node.js with threads enabled
+        if self.config.typescript
+            && matches!(self.config.mode, OutputMode::Node { .. })
+            && self.threads_enabled
+        {
+            let node_atomics_ts = self.ts_for_node_atomics()?;
+            ts.push_str(&node_atomics_ts);
         }
 
-        reset_indentation(&shim)
+        Ok((self.globals.to_owned(), ts, start))
     }
 
-    fn generate_node_wasm_loading(&mut self, path: &Path) -> String {
-        let mut shim = String::new();
-
-        let module_name = "wbg";
-        if let Some(mem) = self.module.memories.iter().next() {
-            if let Some(id) = mem.import {
-                self.module.imports.get_mut(id).module = module_name.to_string();
-                shim.push_str(&format!(
-                    "imports.{module_name} = {{ memory: new WebAssembly.Memory({{"
-                ));
-                shim.push_str(&format!("initial:{}", mem.initial));
-                if let Some(max) = mem.maximum {
-                    shim.push_str(&format!(",maximum:{max}"));
-                }
-                if mem.shared {
-                    shim.push_str(",shared:true");
-                }
-                shim.push_str("}) };");
-            }
-        }
-
-        if self.config.mode.uses_es_modules() {
-            // On windows skip the leading `/` which comes out when we parse a
-            // url to use `C:\...` instead of `\C:\...`
-            shim.push_str(&format!(
-                "
-                import * as path from 'node:path';
-                import * as fs from 'node:fs';
-                import * as process from 'node:process';
-
-                let file = path.dirname(new URL(import.meta.url).pathname);
-                if (process.platform === 'win32') {{
-                    file = file.substring(1);
-                }}
-                const bytes = fs.readFileSync(path.join(file, '{}'));
-            ",
-                path.file_name().unwrap().to_str().unwrap()
-            ));
-            shim.push_str(
-                "
-                const wasmModule = new WebAssembly.Module(bytes);
-                const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
-                const wasm = wasmInstance.exports;
-                export const __wasm = wasm;
-            ",
-            );
-        } else {
-            shim.push_str(&format!(
-                "
-                const path = require('path').join(__dirname, '{}');
-                const bytes = require('fs').readFileSync(path);
-            ",
-                path.file_name().unwrap().to_str().unwrap()
-            ));
-            shim.push_str(
-                "
-                const wasmModule = new WebAssembly.Module(bytes);
-                const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
-                wasm = wasmInstance.exports;
-                module.exports.__wasm = wasm;
-            ",
-            );
-        }
-
-        reset_indentation(&shim)
-    }
-
-    // generates something like
-    // ```js
-    // import * as import0 from './snippets/.../inline1.js';
-    // ```,
-    //
-    // ```js
-    // const imports = {
-    //   __wbindgen_placeholder__: {
-    //     __wbindgen_throw: function(..) { .. },
-    //     ..
-    //   },
-    //   './snippets/deno-65e2634a84cc3c14/inline1.js': import0,
-    // }
-    // ```
-    fn generate_deno_imports(&self) -> (String, String) {
+    fn generate_esm_cjs_imports(&mut self, module_name: &str, has_memory: bool) -> String {
         let mut imports = String::new();
-        let mut wasm_import_object = "const imports = {\n".to_string();
+        let init_memory_arg = if has_memory { "memory" } else { "" };
+        let mut fn_def = format!(
+            "function __wbg_get_imports({init_memory_arg}) {{
+            const import0 = {{
+            __proto__: null,
+        "
+        );
 
-        wasm_import_object.push_str(&format!("  {}: {{\n", crate::PLACEHOLDER_MODULE));
-
-        for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
-            let import = self.module.imports.get(*id);
-            wasm_import_object.push_str(&format!("{}: {},\n", &import.name, js.trim()));
-        }
-
-        wasm_import_object.push_str("\t},\n");
+        let self_module_name = format!("./{module_name}_bg.js");
+        let mut return_stmt = format!(
+            r#"
+        return {{
+            __proto__: null,
+            "{self_module_name}": import0,
+        "#
+        );
 
         // e.g. snippets without parameters
         let import_modules = self
@@ -400,251 +529,59 @@ impl<'a> Context<'a> {
             .map(|import| &import.module)
             .filter(|module| module.as_str() != PLACEHOLDER_MODULE);
         for (i, module) in import_modules.enumerate() {
-            imports.push_str(&format!("import * as import{i} from '{module}'\n"));
-            wasm_import_object.push_str(&format!("  '{module}': import{i},"))
+            let i = i + 1;
+            if self.config.mode.uses_es_modules() {
+                imports.push_str(&format!(r#"import * as import{i} from "{module}""#));
+            } else {
+                imports.push_str(&format!(r#"const import{i} = require("{module}");"#));
+            }
+            imports.push('\n');
+
+            return_stmt.push_str(&format!(r#""{module}": import{i},"#));
+            return_stmt.push('\n');
+        }
+        return_stmt.push_str("};\n");
+
+        for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
+            let import = self.module.imports.get_mut(*id);
+            fn_def.push_str(&format!("{}: {},\n", &import.name, js.trim()));
+            import.module = self_module_name.clone();
         }
 
-        wasm_import_object.push_str("\n};\n\n");
+        fn_def.push_str("};");
+        fn_def.push_str(&return_stmt);
+        fn_def.push_str("}\n");
 
-        (imports, wasm_import_object)
+        format!("{imports}\n{fn_def}\n")
     }
 
-    fn generate_deno_wasm_loading(&self, module_name: &str) -> String {
-        // Deno removed support for .wasm imports in https://github.com/denoland/deno/pull/5135
-        // the issue for bringing it back is https://github.com/denoland/deno/issues/5609.
-        format!(
-            "const wasm_url = new URL('{module_name}_bg.wasm', import.meta.url);
-            let wasmCode = '';
-            switch (wasm_url.protocol) {{
-                case 'file:':
-                    wasmCode = await Deno.readFile(wasm_url);
-                    break
-                case 'https:':
-                case 'http:':
-                    wasmCode = await (await fetch(wasm_url)).arrayBuffer();
-                    break
-                default:
-                    throw new Error(`Unsupported protocol: ${{wasm_url.protocol}}`);
-            }}
-
-            const wasmInstance = (await WebAssembly.instantiate(wasmCode, imports)).instance;
-            const wasm = wasmInstance.exports;
-            export const __wasm = wasm;"
-        )
+    fn generate_bundler_imports(&mut self, module_name: &str) -> String {
+        let mut imports = String::new();
+        let self_module_name = format!("./{module_name}_bg.js");
+        for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
+            let import = self.module.imports.get_mut(*id);
+            if let Some(body) = js.strip_prefix("function") {
+                imports.push_str("export function ");
+                imports.push_str(&import.name);
+                imports.push_str(body.trim());
+                imports.push('\n');
+            } else {
+                imports.push_str("\nexport const ");
+                imports.push_str(&import.name);
+                imports.push_str(" = ");
+                imports.push_str(js.trim());
+                imports.push_str(";\n");
+            }
+            import.module = self_module_name.clone();
+        }
+        imports
     }
 
-    /// Performs the task of actually generating the final JS module, be it
-    /// `--target no-modules`, `--target web`, or for bundlers. This is the very
-    /// last step performed in `finalize`.
-    fn finalize_js(
-        &mut self,
-        module_name: &str,
-        needs_manual_start: bool,
-    ) -> Result<(String, String, Option<String>), Error> {
-        let mut ts;
-        let mut js = String::new();
-        let mut start = None;
-
-        if let OutputMode::NoModules { global } = &self.config.mode {
-            js.push_str(&format!("let {global};\n(function() {{\n"));
+    fn generate_imports(&mut self, module_name: &str, has_memory: bool) -> String {
+        match self.config.mode {
+            OutputMode::Bundler { .. } => self.generate_bundler_imports(module_name),
+            _ => self.generate_esm_cjs_imports(module_name, has_memory),
         }
-
-        // Depending on the output mode, generate necessary glue to actually
-        // import the Wasm file in one way or another.
-        let mut init = (String::new(), String::new());
-        let mut footer = String::new();
-        let mut imports = self.js_import_header()?;
-        match &self.config.mode {
-            // In `--target no-modules` mode we need to both expose a name on
-            // the global object as well as generate our own custom start
-            // function.
-            // `document.currentScript` property can be null in browser extensions
-            OutputMode::NoModules { global } => {
-                js.push_str("const __exports = {};\n");
-                js.push_str("let script_src;\n");
-                js.push_str(
-                    "\
-                    if (typeof document !== 'undefined' && document.currentScript !== null) {
-                        script_src = new URL(document.currentScript.src, location.href).toString();
-                    }\n",
-                );
-                js.push_str("let wasm = undefined;\n");
-                init = self.gen_init(needs_manual_start, None)?;
-                footer.push_str(&format!(
-                    "{global} = Object.assign(__wbg_init, {{ initSync }}, __exports);\n"
-                ));
-            }
-
-            // With normal CommonJS node we need to defer requiring the wasm
-            // until the end so most of our own exports are hooked up
-            OutputMode::Node { module: false } => {
-                js.push_str(&self.generate_node_imports());
-
-                js.push_str("let wasm;\n");
-
-                for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
-                    let import = self.module.imports.get(*id);
-                    footer.push_str("\nmodule.exports.");
-                    footer.push_str(&import.name);
-                    footer.push_str(" = ");
-                    footer.push_str(js.trim());
-                    footer.push_str(";\n");
-                }
-
-                footer
-                    .push_str(&self.generate_node_wasm_loading(Path::new(&format!(
-                        "./{module_name}_bg.wasm"
-                    ))));
-
-                if needs_manual_start {
-                    footer.push_str("\nwasm.__wbindgen_start();\n");
-                }
-            }
-
-            OutputMode::Deno => {
-                let (js_imports, wasm_import_object) = self.generate_deno_imports();
-                imports.push_str(&js_imports);
-                footer.push_str(&wasm_import_object);
-
-                footer.push_str(&self.generate_deno_wasm_loading(module_name));
-
-                footer.push_str("\n\n");
-
-                if needs_manual_start {
-                    footer.push_str("\nwasm.__wbindgen_start();\n");
-                }
-            }
-
-            // With Bundlers we can simply import the Wasm file as if it were an ES module
-            // and let the bundler/runtime take care of it.
-            // With Node we manually read the Wasm file from the filesystem and instantiate it.
-            OutputMode::Bundler { .. } | OutputMode::Node { module: true } => {
-                for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
-                    let import = self.module.imports.get_mut(*id);
-                    import.module = format!("./{module_name}_bg.js");
-                    if let Some(body) = js.strip_prefix("function") {
-                        footer.push_str("\nexport function ");
-                        footer.push_str(&import.name);
-                        footer.push_str(body.trim());
-                        footer.push_str(";\n");
-                    } else {
-                        footer.push_str("\nexport const ");
-                        footer.push_str(&import.name);
-                        footer.push_str(" = ");
-                        footer.push_str(js.trim());
-                        footer.push_str(";\n");
-                    }
-                }
-
-                match self.config.mode {
-                    OutputMode::Bundler { .. } => {
-                        self.imports_post.push_str(
-                            "\
-                            let wasm;
-                            export function __wbg_set_wasm(val) {
-                                wasm = val;
-                            }
-                            ",
-                        );
-
-                        start.get_or_insert_with(String::new).push_str(&format!(
-                            "\
-import {{ __wbg_set_wasm }} from \"./{module_name}_bg.js\";
-__wbg_set_wasm(wasm);"
-                        ));
-                    }
-
-                    OutputMode::Node { module: true } => {
-                        self.imports_post.push_str(
-                            "\
-                            let wasm;
-                            let wasmModule;
-                            export function __wbg_set_wasm(exports, module) {
-                                wasm = exports;
-                                wasmModule = module;
-                            }
-                            ",
-                        );
-
-                        let start = start.get_or_insert_with(String::new);
-                        start.push_str(&self.generate_node_imports());
-                        start.push_str(&self.generate_node_wasm_loading(Path::new(&format!(
-                            "./{module_name}_bg.wasm"
-                        ))));
-
-                        start.push_str(&format!(
-                            "imports[\"./{module_name}_bg.js\"].__wbg_set_wasm(wasm, wasmModule);"
-                        ));
-                    }
-
-                    _ => {}
-                }
-
-                if needs_manual_start {
-                    start
-                        .get_or_insert_with(String::new)
-                        .push_str("\nwasm.__wbindgen_start();\n");
-                }
-            }
-
-            // With a browser-native output we're generating an ES module, but
-            // browsers don't support natively importing Wasm right now so we
-            // expose the same initialization function as `--target no-modules`
-            // as the default export of the module.
-            OutputMode::Web => {
-                self.imports_post.push_str("let wasm;\n");
-                init = self.gen_init(needs_manual_start, Some(&mut imports))?;
-                footer.push_str("export { initSync };\n");
-                footer.push_str("export default __wbg_init;");
-            }
-        }
-
-        // Before putting the static init code declaration info, put all existing typescript into a `wasm_bindgen` namespace declaration.
-        // Not sure if this should happen in all cases, so just adding it to NoModules for now...
-        if self.config.mode.no_modules() {
-            ts = String::from("declare namespace wasm_bindgen {\n\t");
-            ts.push_str(&self.typescript.replace('\n', "\n\t"));
-            ts.push_str("\n}\n");
-        } else {
-            ts = self.typescript.clone();
-        }
-
-        let (init_js, init_ts) = init;
-
-        ts.push_str(&init_ts);
-
-        // Emit all the JS for importing all our functionality
-        assert!(
-            !self.config.mode.uses_es_modules() || js.is_empty(),
-            "ES modules require imports to be at the start of the file, but we \
-             generated some JS before the imports: {js}"
-        );
-
-        let mut push_with_newline = |s| {
-            js.push_str(s);
-            if !s.is_empty() {
-                js.push('\n');
-            }
-        };
-
-        push_with_newline(&imports);
-        push_with_newline(&self.imports_post);
-
-        // Emit all our exports from this module
-        push_with_newline(&self.globals);
-
-        // Generate the initialization glue, if there was any
-        push_with_newline(&init_js);
-        push_with_newline(&footer);
-        if self.config.mode.no_modules() {
-            js.push_str("})();\n");
-        }
-
-        while js.contains("\n\n\n") {
-            js = js.replace("\n\n\n", "\n\n");
-        }
-
-        Ok((js, ts, start))
     }
 
     fn js_import_header(&self) -> Result<String, Error> {
@@ -657,10 +594,7 @@ __wbg_set_wasm(wasm);"
         match &self.config.mode {
             OutputMode::NoModules { .. } => {
                 if let Some((module, _items)) = self.js_imports.iter().next() {
-                    bail!(
-                        "importing from `{}` isn't supported with `--target no-modules`",
-                        module
-                    );
+                    bail!("importing from `{module}` isn't supported with `--target no-modules`");
                 }
             }
 
@@ -671,7 +605,15 @@ __wbg_set_wasm(wasm);"
                         if i > 0 {
                             imports.push_str(", ");
                         }
-                        imports.push_str(item);
+                        if is_valid_ident(item) {
+                            imports.push_str(item);
+                        } else {
+                            // Invalid identifiers should already have a valid rename
+                            assert!(rename.is_some());
+                            imports.push('\'');
+                            imports.push_str(&escape_string(item));
+                            imports.push('\'');
+                        }
                         if let Some(other) = rename {
                             imports.push_str(": ");
                             imports.push_str(other)
@@ -690,6 +632,7 @@ __wbg_set_wasm(wasm);"
             OutputMode::Bundler { .. }
             | OutputMode::Node { module: true }
             | OutputMode::Web
+            | OutputMode::Module
             | OutputMode::Deno => {
                 for (module, items) in crate::sorted_iter(&self.js_imports) {
                     imports.push_str("import { ");
@@ -697,10 +640,16 @@ __wbg_set_wasm(wasm);"
                         if i > 0 {
                             imports.push_str(", ");
                         }
-                        imports.push_str(item);
+                        if is_valid_ident(item) {
+                            imports.push_str(item);
+                        } else {
+                            imports.push('\'');
+                            imports.push_str(item);
+                            imports.push('\'');
+                        }
                         if let Some(other) = rename {
                             imports.push_str(" as ");
-                            imports.push_str(other)
+                            imports.push_str(other);
                         }
                     }
                     imports.push_str(" } from '");
@@ -747,7 +696,7 @@ __wbg_set_wasm(wasm);"
 
             sync_init_function.push_str(&format!(
                 "\
-                {declare_or_export} type SyncInitInput = BufferSource | WebAssembly.Module;\n\
+                {declare_or_export} type SyncInitInput = BufferSource | WebAssembly.Module;\n\n\
                 /**\n\
                 * Instantiates the given `module`, which can either be bytes or\n\
                 * a precompiled `WebAssembly.Module`.\n\
@@ -785,102 +734,132 @@ __wbg_set_wasm(wasm);"
         ))
     }
 
-    fn gen_init(
-        &mut self,
+    /// Generate TypeScript definitions for Node.js targets with threads/atomics enabled.
+    fn ts_for_node_atomics(&self) -> Result<String, Error> {
+        let output = crate::wasm2es6js::interface(self.module)?;
+
+        Ok(format!(
+            r#"
+export type SyncInitInput = BufferSource | WebAssembly.Module;
+
+export interface InitOutput {{
+{output}}}
+
+export interface InitSyncOptions {{
+    module?: SyncInitInput;
+    memory?: WebAssembly.Memory;
+    thread_stack_size?: number;
+}}
+
+/**
+ * Initialize the WebAssembly module synchronously.
+ *
+ * For the main thread, this is called automatically on import.
+ * Worker threads should call this explicitly with shared module and memory:
+ *
+ * ```js
+ * initSync({{ module: __wbg_wasm_module, memory: __wbg_memory }});
+ * ```
+ *
+ * @param opts - Initialization options
+ * @returns The exports object
+ */
+export function initSync(opts?: InitSyncOptions): InitOutput;
+
+/**
+ * Get the imports object for WebAssembly instantiation.
+ *
+ * @param memory - Optional shared memory to use instead of creating new
+ * @returns The imports object for WebAssembly.Instance
+ */
+export function __wbg_get_imports(memory?: WebAssembly.Memory): WebAssembly.Imports;
+
+/** The compiled WebAssembly module. Can be shared with workers. */
+export const __wbg_wasm_module: WebAssembly.Module;
+
+/** The shared WebAssembly memory. */
+export const __wbg_memory: WebAssembly.Memory;
+"#
+        ))
+    }
+
+    fn generate_module_wasm_loading(&self, module_name: &str, needs_manual_start: bool) -> String {
+        format!(
+            r#"import source wasmModule from "./{module_name}_bg.wasm";
+            const wasmInstance = new WebAssembly.Instance(wasmModule, __wbg_get_imports());
+            let wasm = wasmInstance.exports;
+            {start}
+            "#,
+            start = if needs_manual_start {
+                "wasm.__wbindgen_start();"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn generate_bundler_wasm_loading(&self) -> String {
+        r#"
+        let wasm;
+        export function __wbg_set_wasm(val) {
+            wasm = val;
+        }
+        "#
+        .to_string()
+    }
+
+    fn generate_bundler_start(&self, module_name: &str, needs_manual_start: bool) -> String {
+        let mut start = String::new();
+
+        if self.config.typescript {
+            // jsr-self-types directive
+            start.push_str(&format!(r#"/* @ts-self-types="./{module_name}.d.ts" */"#));
+            start.push_str("\n\n");
+        }
+
+        start.push_str(&format!(
+            r#"import * as wasm from "./{module_name}_bg.wasm";
+            import {{ __wbg_set_wasm }} from "./{module_name}_bg.js";
+            __wbg_set_wasm(wasm);
+        "#
+        ));
+
+        if needs_manual_start {
+            start.push_str("wasm.__wbindgen_start();");
+        }
+
+        if !self.export_name_list.is_empty() {
+            start.push_str("\nexport {\n");
+            if let Some((last, list)) = self.export_name_list.split_last() {
+                for name in list {
+                    if is_valid_ident(name) {
+                        start.push_str(&format!("{name}, "));
+                    } else {
+                        start.push_str(&format!(r#""{name}", "#));
+                    }
+                }
+                if is_valid_ident(last) {
+                    start.push_str(last);
+                } else {
+                    start.push_str(&format!(r#""{last}""#));
+                }
+            }
+            start.push('\n');
+            start.push_str(r#"} from "./"#);
+            start.push_str(module_name);
+            start.push_str(r#"_bg.js";"#);
+            start.push('\n');
+        }
+
+        start
+    }
+
+    fn generate_web_loading(
+        &self,
         needs_manual_start: bool,
-        mut imports: Option<&mut String>,
-    ) -> Result<(String, String), Error> {
-        let module_name = "wbg";
-        let mut init_memory_arg = "";
-        let mut init_memory = String::new();
-        let mut has_memory = false;
-        if let Some(mem) = self.module.memories.iter().next() {
-            if let Some(id) = mem.import {
-                self.module.imports.get_mut(id).module = module_name.to_string();
-                init_memory =
-                    format!("imports.{module_name}.memory = memory || new WebAssembly.Memory({{");
-                init_memory.push_str(&format!("initial:{}", mem.initial));
-                if let Some(max) = mem.maximum {
-                    init_memory.push_str(&format!(",maximum:{max}"));
-                }
-                if mem.shared {
-                    init_memory.push_str(",shared:true");
-                }
-                init_memory.push_str("});");
-                init_memory_arg = ", memory";
-                has_memory = true;
-            }
-        }
-
-        let default_module_path = if !self.config.omit_default_module_path {
-            match self.config.mode {
-                OutputMode::Web => format!(
-                    "\
-                    if (typeof module_or_path === 'undefined') {{
-                        module_or_path = new URL('{stem}_bg.wasm', import.meta.url);
-                    }}",
-                    stem = self.config.stem()?
-                ),
-                OutputMode::NoModules { .. } => "\
-                    if (typeof module_or_path === 'undefined' && typeof script_src !== 'undefined') {
-                        module_or_path = script_src.replace(/\\.js$/, '_bg.wasm');
-                    }"
-                .to_string(),
-                _ => "".to_string(),
-            }
-        } else {
-            String::from("")
-        };
-
-        let ts = self.ts_for_init_fn(
-            has_memory,
-            !self.config.omit_default_module_path && !default_module_path.is_empty(),
-        )?;
-
-        // Initialize the `imports` object for all import definitions that we're
-        // directed to wire up.
-        let mut imports_init = String::new();
-
-        imports_init.push_str("imports.");
-        imports_init.push_str(module_name);
-        imports_init.push_str(" = {};\n");
-
-        for (id, js) in iter_by_import(&self.wasm_import_definitions, self.module) {
-            let import = self.module.imports.get_mut(*id);
-            import.module = module_name.to_string();
-            imports_init.push_str("imports.");
-            imports_init.push_str(module_name);
-            imports_init.push('.');
-            imports_init.push_str(&import.name);
-            imports_init.push_str(" = ");
-            imports_init.push_str(js.trim());
-            imports_init.push_str(";\n");
-        }
-
-        let extra_modules = self
-            .module
-            .imports
-            .iter()
-            .filter(|i| !self.wasm_import_definitions.contains_key(&i.id()))
-            .filter(|i| {
-                // Importing memory is handled specially in this area, so don't
-                // consider this a candidate for importing from extra modules.
-                !(matches!(i.kind, walrus::ImportKind::Memory(_)))
-            })
-            .map(|i| &i.module)
-            .collect::<BTreeSet<_>>();
-        for (i, extra) in extra_modules.iter().enumerate() {
-            let imports = match &mut imports {
-                Some(list) => list,
-                None => bail!(
-                    "cannot import from modules (`{}`) with `--no-modules`",
-                    extra
-                ),
-            };
-            imports.push_str(&format!("import * as __wbg_star{i} from '{extra}';\n"));
-            imports_init.push_str(&format!("imports['{extra}'] = __wbg_star{i};\n"));
-        }
-
+        default_module_path: &str,
+        has_memory: bool,
+    ) -> String {
         let mut init_memviews = String::new();
         for &(num, ref views) in self.memories.values() {
             for kind in views {
@@ -894,126 +873,104 @@ __wbg_set_wasm(wasm);"
                 .unwrap()
             }
         }
+        format!(
+            "let wasmModule, wasm;
+            function __wbg_finalize_init(instance, module{init_stack_size_arg}) {{
+                wasm = instance.exports;
+                wasmModule = module;
+                {init_memviews}{init_stack_size_check}{start}return wasm;
+            }}
 
-        let js = format!(
-            "\
-                async function __wbg_load(module, imports) {{
-                    if (typeof Response === 'function' && module instanceof Response) {{
-                        if (typeof WebAssembly.instantiateStreaming === 'function') {{
-                            try {{
-                                return await WebAssembly.instantiateStreaming(module, imports);
+            async function __wbg_load(module, imports) {{
+                if (typeof Response === 'function' && module instanceof Response) {{
+                    if (typeof WebAssembly.instantiateStreaming === 'function') {{
+                        try {{
+                            return await WebAssembly.instantiateStreaming(module, imports);
+                        }} catch (e) {{
+                            const validResponse = module.ok && expectedResponseType(module.type);
 
-                            }} catch (e) {{
-                                if (module.headers.get('Content-Type') != 'application/wasm') {{
-                                    console.warn(\"`WebAssembly.instantiateStreaming` failed \
-                                                    because your server does not serve Wasm with \
-                                                    `application/wasm` MIME type. Falling back to \
-                                                    `WebAssembly.instantiate` which is slower. Original \
-                                                    error:\\n\", e);
+                            if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {{
+                                console.warn(\"`WebAssembly.instantiateStreaming` failed \
+                                                because your server does not serve Wasm with \
+                                                `application/wasm` MIME type. Falling back to \
+                                                `WebAssembly.instantiate` which is slower. Original \
+                                                error:\\n\", e);
 
-                                }} else {{
-                                    throw e;
-                                }}
-                            }}
+                            }} else {{ throw e; }}
                         }}
+                    }}
 
-                        const bytes = await module.arrayBuffer();
-                        return await WebAssembly.instantiate(bytes, imports);
+                    const bytes = await module.arrayBuffer();
+                    return await WebAssembly.instantiate(bytes, imports);
+                }} else {{
+                    const instance = await WebAssembly.instantiate(module, imports);
 
+                    if (instance instanceof WebAssembly.Instance) {{
+                        return {{ instance, module }};
                     }} else {{
-                        const instance = await WebAssembly.instantiate(module, imports);
-
-                        if (instance instanceof WebAssembly.Instance) {{
-                            return {{ instance, module }};
-
-                        }} else {{
-                            return instance;
-                        }}
+                        return instance;
                     }}
                 }}
 
-                function __wbg_get_imports() {{
-                    const imports = {{}};
-                    {imports_init}
-                    return imports;
-                }}
-
-                function __wbg_init_memory(imports, memory) {{
-                    {init_memory}
-                }}
-
-                function __wbg_finalize_init(instance, module{init_stack_size_arg}) {{
-                    wasm = instance.exports;
-                    __wbg_init.__wbindgen_wasm_module = module;
-                    {init_memviews}
-                    {init_stack_size_check}
-                    {start}
-                    return wasm;
-                }}
-
-                function initSync(module{init_memory_arg}) {{
-                    if (wasm !== undefined) return wasm;
-
-                    {init_stack_size}
-                    if (typeof module !== 'undefined') {{
-                        if (Object.getPrototypeOf(module) === Object.prototype) {{
-                            ({{module{init_memory_arg}{init_stack_size_arg}}} = module)
-                        }} else {{
-                            console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
-                        }}
+                function expectedResponseType(type) {{
+                    switch (type) {{
+                        case 'basic': case 'cors': case 'default': return true;
                     }}
+                    return false;
+                }}
+            }}
 
-                    const imports = __wbg_get_imports();
+            function initSync(module{init_memory_arg}) {{
+                if (wasm !== undefined) return wasm;
 
-                    __wbg_init_memory(imports{init_memory_arg});
-
-                    if (!(module instanceof WebAssembly.Module)) {{
-                        module = new WebAssembly.Module(module);
+                {init_stack_size}
+                if (module !== undefined) {{
+                    if (Object.getPrototypeOf(module) === Object.prototype) {{
+                        ({{module{init_memory_arg}{init_stack_size_arg}}} = module)
+                    }} else {{
+                        console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
                     }}
-
-                    const instance = new WebAssembly.Instance(module, imports);
-
-                    return __wbg_finalize_init(instance, module{init_stack_size_arg});
                 }}
 
-                async function __wbg_init(module_or_path{init_memory_arg}) {{
-                    if (wasm !== undefined) return wasm;
-
-                    {init_stack_size}
-                    if (typeof module_or_path !== 'undefined') {{
-                        if (Object.getPrototypeOf(module_or_path) === Object.prototype) {{
-                            ({{module_or_path{init_memory_arg}{init_stack_size_arg}}} = module_or_path)
-                        }} else {{
-                            console.warn('using deprecated parameters for the initialization function; pass a single object instead')
-                        }}
-                    }}
-
-                    {default_module_path}
-                    const imports = __wbg_get_imports();
-
-                    if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {{
-                        module_or_path = fetch(module_or_path);
-                    }}
-
-                    __wbg_init_memory(imports{init_memory_arg});
-
-                    const {{ instance, module }} = await __wbg_load(await module_or_path, imports);
-
-                    return __wbg_finalize_init(instance, module{init_stack_size_arg});
+                const imports = __wbg_get_imports({init_memory_arg_alone});
+                if (!(module instanceof WebAssembly.Module)) {{
+                    module = new WebAssembly.Module(module);
                 }}
+                const instance = new WebAssembly.Instance(module, imports);
+                return __wbg_finalize_init(instance, module{init_stack_size_arg});
+            }}
+
+            async function __wbg_init(module_or_path{init_memory_arg}) {{
+                if (wasm !== undefined) return wasm;
+
+                {init_stack_size}
+                if (module_or_path !== undefined) {{
+                    if (Object.getPrototypeOf(module_or_path) === Object.prototype) {{
+                        ({{module_or_path{init_memory_arg}{init_stack_size_arg}}} = module_or_path)
+                    }} else {{
+                        console.warn('using deprecated parameters for the initialization function; pass a single object instead')
+                    }}
+                }}
+
+                {default_module_path}
+                const imports = __wbg_get_imports({init_memory_arg_alone});
+
+                if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {{
+                    module_or_path = fetch(module_or_path);
+                }}
+
+                const {{ instance, module }} = await __wbg_load(await module_or_path, imports);
+
+                return __wbg_finalize_init(instance, module{init_stack_size_arg});
+            }}
             ",
-            init_memory_arg = init_memory_arg,
-            default_module_path = default_module_path,
-            init_memory = init_memory,
-            init_memviews = init_memviews,
             start = if needs_manual_start && self.threads_enabled {
-                "wasm.__wbindgen_start(thread_stack_size);"
+                "wasm.__wbindgen_start(thread_stack_size);\n"
             } else if needs_manual_start {
-                "wasm.__wbindgen_start();"
+                "wasm.__wbindgen_start();\n"
             } else {
                 ""
             },
-            imports_init = imports_init,
             init_stack_size = if self.threads_enabled {
                 "let thread_stack_size"
             } else {
@@ -1026,27 +983,283 @@ __wbg_set_wasm(wasm);"
             },
             init_stack_size_check = if self.threads_enabled {
                 format!(
-                    "if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {} !== 0)) {{ throw 'invalid stack size' }}",
-                    wasm_bindgen_threads_xform::PAGE_SIZE,
+                    "if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {} !== 0)) {{
+                        throw new Error('invalid stack size');
+                    }}\n\n",
+                    threads_xform::PAGE_SIZE,
                 )
             } else {
                 String::new()
             },
-        );
+            init_memory_arg = if has_memory {
+                ", memory"
+            } else {
+                ""
+            },
+            init_memory_arg_alone = if has_memory {
+                "memory"
+            } else {
+                ""
+            },
+        )
+    }
 
-        Ok((js, ts))
+    fn generate_deno_wasm_loading(&self, module_name: &str, needs_manual_start: bool) -> String {
+        // Deno added support for .wasm imports in 2024 in https://github.com/denoland/deno/issues/2552.
+        // It's fairly recent, so use old-school Wasm loading for broader compat for now.
+        format!(
+            "const wasmUrl = new URL('{module_name}_bg.wasm', import.meta.url);
+            const wasmInstantiated = await WebAssembly.instantiateStreaming(fetch(wasmUrl), __wbg_get_imports());
+            const wasm = wasmInstantiated.instance.exports;
+            {start}",
+            start = if needs_manual_start {
+                "wasm.__wbindgen_start();\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn generate_node_esm_wasm_loading(
+        &self,
+        module_name: &str,
+        needs_manual_start: bool,
+    ) -> String {
+        if self.threads_enabled {
+            // For threads: generate initSync that accepts custom memory
+            let start_call = if needs_manual_start {
+                format!(
+                    r#"
+    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {page_size} !== 0)) {{
+        throw new Error('invalid stack size');
+    }}
+
+    wasm.__wbindgen_start(thread_stack_size);"#,
+                    page_size = crate::transforms::threads::PAGE_SIZE,
+                )
+            } else {
+                String::new()
+            };
+
+            format!(
+                r#"import {{ readFileSync }} from 'node:fs';
+import {{ isMainThread }} from 'node:worker_threads';
+
+let wasm;
+let wasmModule;
+let memory;
+let __initialized = false;
+
+export function initSync(opts = {{}}) {{
+    if (__initialized) return wasm;
+
+    let {{ module, memory: mem, thread_stack_size }} = opts;
+
+    if (module === undefined) {{
+        const wasmUrl = new URL('{module_name}_bg.wasm', import.meta.url);
+        module = readFileSync(wasmUrl);
+    }}
+
+    if (!(module instanceof WebAssembly.Module)) {{
+        wasmModule = new WebAssembly.Module(module);
+    }} else {{
+        wasmModule = module;
+    }}
+
+    const wasmImports = __wbg_get_imports(mem);
+    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+    wasm = instance.exports;
+    memory = wasmImports['./{module_name}_bg.js'].memory;
+{start_call}
+    __initialized = true;
+    return wasm;
+}}
+
+// Auto-initialize for backwards compatibility (only on main thread)
+// Worker threads should call initSync({{ module, memory }}) explicitly
+if (isMainThread) {{
+    initSync();
+}}
+
+export {{ wasm as __wasm, wasmModule as __wbg_wasm_module, memory as __wbg_memory, __wbg_get_imports }};
+"#
+            )
+        } else {
+            format!(
+                r#"import {{ readFileSync }} from 'node:fs';
+            const wasmUrl = new URL('{module_name}_bg.wasm', import.meta.url);
+            const wasmBytes = readFileSync(wasmUrl);
+            const wasmModule = new WebAssembly.Module(wasmBytes);
+            let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
+            {start}"#,
+                start = if needs_manual_start {
+                    "wasm.__wbindgen_start();\n"
+                } else {
+                    ""
+                },
+            )
+        }
+    }
+
+    fn generate_node_cjs_wasm_loading(
+        &self,
+        module_name: &str,
+        needs_manual_start: bool,
+    ) -> String {
+        if self.threads_enabled {
+            // For threads: generate initSync that accepts custom memory
+            let start_call = if needs_manual_start {
+                format!(
+                    r#"
+    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {page_size} !== 0)) {{
+        throw new Error('invalid stack size');
+    }}
+
+    wasm.__wbindgen_start(thread_stack_size);"#,
+                    page_size = crate::transforms::threads::PAGE_SIZE,
+                )
+            } else {
+                String::new()
+            };
+
+            format!(
+                r#"let wasm;
+let wasmModule;
+let memory;
+let __initialized = false;
+
+// Export __wbg_get_imports for workers to use
+exports.__wbg_get_imports = __wbg_get_imports;
+
+exports.initSync = function(opts) {{
+    if (opts === undefined) opts = {{}};
+    if (__initialized) return wasm;
+
+    let module = opts.module;
+    let mem = opts.memory;
+    let thread_stack_size = opts.thread_stack_size;
+
+    if (module === undefined) {{
+        const wasmPath = `${{__dirname}}/{module_name}_bg.wasm`;
+        module = require('fs').readFileSync(wasmPath);
+    }}
+
+    if (!(module instanceof WebAssembly.Module)) {{
+        wasmModule = new WebAssembly.Module(module);
+    }} else {{
+        wasmModule = module;
+    }}
+
+    const wasmImports = __wbg_get_imports(mem);
+    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+    wasm = instance.exports;
+    memory = wasmImports['./{module_name}_bg.js'].memory;
+    exports.__wasm = wasm;
+    exports.__wbg_wasm_module = wasmModule;
+    exports.__wbg_memory = memory;
+{start_call}
+    __initialized = true;
+    return wasm;
+}};
+
+// Auto-initialize for backwards compatibility (only on main thread)
+// Worker threads should call initSync({{ module, memory }}) explicitly
+if (require('worker_threads').isMainThread) {{
+    exports.initSync();
+}}
+"#
+            )
+        } else {
+            format!(
+                r#"const wasmPath = `${{__dirname}}/{module_name}_bg.wasm`;
+            const wasmBytes = require('fs').readFileSync(wasmPath);
+            const wasmModule = new WebAssembly.Module(wasmBytes);
+            let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
+            {start}"#,
+                start = if needs_manual_start {
+                    "wasm.__wbindgen_start();\n"
+                } else {
+                    ""
+                },
+            )
+        }
+    }
+
+    fn generate_wasm_loading(
+        &self,
+        module_name: &str,
+        needs_manual_start: bool,
+        has_memory: bool,
+    ) -> String {
+        match self.config.mode {
+            OutputMode::Module => {
+                self.generate_module_wasm_loading(module_name, needs_manual_start)
+            }
+            OutputMode::Bundler { .. } => self.generate_bundler_wasm_loading(),
+            OutputMode::Deno => self.generate_deno_wasm_loading(module_name, needs_manual_start),
+            OutputMode::Node { module: true } => {
+                self.generate_node_esm_wasm_loading(module_name, needs_manual_start)
+            }
+            OutputMode::Node { module: false } => {
+                self.generate_node_cjs_wasm_loading(module_name, needs_manual_start)
+            }
+            OutputMode::Web => {
+                let default_module_path = if self.config.omit_default_module_path {
+                    ""
+                } else {
+                    &format!(
+                        "if (module_or_path === undefined) {{
+                            module_or_path = new URL('{module_name}_bg.wasm', import.meta.url);
+                        }}"
+                    )
+                };
+                let mut loading =
+                    self.generate_web_loading(needs_manual_start, default_module_path, has_memory);
+
+                loading.push_str("\nexport { initSync, __wbg_init as default };");
+
+                loading
+            }
+            OutputMode::NoModules { .. } => {
+                let default_module_path = if self.config.omit_default_module_path {
+                    ""
+                } else {
+                    r#"if (module_or_path === undefined && script_src !== undefined) {
+                        module_or_path = script_src.replace(/\.js$/, "_bg.wasm");
+                    }"#
+                };
+                self.generate_web_loading(needs_manual_start, default_module_path, has_memory)
+            }
+        }
+    }
+
+    fn require_class<'b>(&'b mut self, name: &str) -> &'b mut ExportedClass {
+        if self
+            .exported_classes
+            .get(name)
+            .is_none_or(|cls| cls.identifier.is_empty())
+        {
+            let identifier = self.generate_identifier(name);
+            self.exported_classes
+                .entry(name.to_string())
+                .or_default()
+                .identifier = identifier;
+        }
+        self.exported_classes.get_mut(name).unwrap()
     }
 
     fn write_classes(&mut self) -> Result<(), Error> {
-        for (class, exports) in self.exported_classes.take().unwrap() {
-            self.write_class(&class, &exports)?;
+        let exported_classes = std::mem::take(&mut self.exported_classes);
+        for (class, exports) in exported_classes {
+            self.write_class(&class, exports)?;
         }
         Ok(())
     }
 
-    fn write_class(&mut self, name: &str, class: &ExportedClass) -> Result<(), Error> {
-        let mut dst = format!("class {name} {{\n");
-        let mut ts_dst = format!("export {dst}");
+    fn write_class(&mut self, name: &str, class: ExportedClass) -> Result<(), Error> {
+        let identifier = &class.identifier;
+        let mut dst = format!("class {identifier} {{\n");
+        let mut ts_dst = dst.clone();
 
         if !class.has_constructor {
             // declare the constructor as private to prevent direct instantiation
@@ -1054,7 +1267,7 @@ __wbg_set_wasm(wasm);"
 
             if self.config.debug {
                 dst.push_str(
-                    "
+                    "\
                         constructor() {
                             throw new Error('cannot invoke `new` directly');
                         }
@@ -1064,13 +1277,25 @@ __wbg_set_wasm(wasm);"
         }
 
         if class.wrap_needed {
+            let (ptr_assignment, register_data) = if self.config.generate_reset_state {
+                (
+                    "\
+                    obj.__wbg_ptr = ptr;
+                    obj.__wbg_inst = __wbg_instance_id;
+                    ",
+                    "{ ptr, instance: __wbg_instance_id }",
+                )
+            } else {
+                ("obj.__wbg_ptr = ptr;", "obj.__wbg_ptr")
+            };
+
             dst.push_str(&format!(
-                "
+                "\
                 static __wrap(ptr) {{
                     ptr = ptr >>> 0;
-                    const obj = Object.create({name}.prototype);
-                    obj.__wbg_ptr = ptr;
-                    {name}Finalization.register(obj, obj.__wbg_ptr, obj);
+                    const obj = Object.create({identifier}.prototype);
+                    {ptr_assignment}
+                    {identifier}Finalization.register(obj, {register_data}, obj);
                     return obj;
                 }}
                 "
@@ -1079,9 +1304,9 @@ __wbg_set_wasm(wasm);"
 
         if class.unwrap_needed {
             dst.push_str(&format!(
-                "
+                "\
                 static __unwrap(jsValue) {{
-                    if (!(jsValue instanceof {name})) {{
+                    if (!(jsValue instanceof {identifier})) {{
                         return 0;
                     }}
                     return jsValue.__destroy_into_raw();
@@ -1090,12 +1315,24 @@ __wbg_set_wasm(wasm);"
             ));
         }
 
-        self.global(&format!(
-            "
-            const {name}Finalization = (typeof FinalizationRegistry === 'undefined')
+        let finalization_callback = if self.config.generate_reset_state {
+            format!(
+                "({{ ptr, instance }}) => {{
+                if (instance === __wbg_instance_id) wasm.{}(ptr >>> 0, 1);
+            }}",
+                wasm_bindgen_shared::free_function(name)
+            )
+        } else {
+            format!(
+                "ptr => wasm.{}(ptr >>> 0, 1)",
+                wasm_bindgen_shared::free_function(name)
+            )
+        };
+
+        self.globals.push_str(&format!(
+            "const {identifier}Finalization = (typeof FinalizationRegistry === 'undefined')
                 ? {{ register: () => {{}}, unregister: () => {{}} }}
-                : new FinalizationRegistry(ptr => wasm.{}(ptr >>> 0, 1));",
-            wasm_bindgen_shared::free_function(name),
+                : new FinalizationRegistry({finalization_callback});\n"
         ));
 
         // If the class is inspectable, generate `toJSON` and `toString`
@@ -1105,11 +1342,10 @@ __wbg_set_wasm(wasm);"
             // Creates a `toJSON` method which returns an object of all readable properties
             // This object looks like { a: this.a, b: this.b }
             dst.push_str(&format!(
-                "
+                "\
                 toJSON() {{
                     return {{{}}};
                 }}
-
                 toString() {{
                     return JSON.stringify(this);
                 }}
@@ -1146,7 +1382,7 @@ __wbg_set_wasm(wasm);"
                 // output of `console.log` and friends. The constructor is set
                 // to display the class name as a typical JavaScript class would
                 dst.push_str(&format!(
-                    "
+                    "\
                     [{module_name}.custom]() {{
                         return Object.assign(Object.create({{constructor: this.constructor}}), this.toJSON());
                     }}
@@ -1156,14 +1392,13 @@ __wbg_set_wasm(wasm);"
         }
 
         dst.push_str(&format!(
-            "
+            "\
             __destroy_into_raw() {{
                 const ptr = this.__wbg_ptr;
                 this.__wbg_ptr = 0;
-                {name}Finalization.unregister(this);
+                {identifier}Finalization.unregister(this);
                 return ptr;
             }}
-
             free() {{
                 const ptr = this.__destroy_into_raw();
                 wasm.{}(ptr, 0);
@@ -1172,30 +1407,47 @@ __wbg_set_wasm(wasm);"
             wasm_bindgen_shared::free_function(name),
         ));
         ts_dst.push_str("  free(): void;\n");
-        if self.config.symbol_dispose {
-            dst.push_str(
-                "
-                [Symbol.dispose]() {{
-                    this.free();
-                }}
-                ",
-            );
-            ts_dst.push_str("  [Symbol.dispose](): void;\n");
-        }
+        ts_dst.push_str("  [Symbol.dispose](): void;\n");
         dst.push_str(&class.contents);
         ts_dst.push_str(&class.typescript);
 
-        self.write_class_field_types(class, &mut ts_dst);
+        self.write_class_field_types(&class, &mut ts_dst);
 
-        dst.push('}');
+        dst.push_str("}\n");
         ts_dst.push_str("}\n");
 
-        self.export(name, ExportJs::Class(&dst), Some(&class.comments))?;
-
-        if class.generate_typescript {
-            self.typescript.push_str(&class.comments);
-            self.typescript.push_str(&ts_dst);
+        // For hidden classes, add export type statement
+        if class.private {
+            ts_dst.push_str(&format!("export type {{ {name} }};\n"));
         }
+
+        dst.push_str(&format!(
+            "if (Symbol.dispose) {identifier}.prototype[Symbol.dispose] = {identifier}.prototype.free;\n"
+        ));
+
+        let ts_comments = if class.generate_typescript {
+            Some(class.comments.clone())
+        } else {
+            None
+        };
+
+        define_export(
+            &mut self.exports,
+            name,
+            class.js_namespace.as_deref().unwrap_or_default(),
+            ExportEntry::Definition(ExportDefinition {
+                identifier: class.identifier,
+                comments: Some(class.comments),
+                definition: dst,
+                ts_definition: if class.generate_typescript {
+                    ts_dst
+                } else {
+                    String::new()
+                },
+                ts_comments,
+                private: class.private,
+            }),
+        )?;
 
         Ok(())
     }
@@ -1318,13 +1570,101 @@ __wbg_set_wasm(wasm);"
         }
     }
 
-    fn expose_drop_ref(&mut self) {
-        if !self.should_write_global("drop_ref") {
-            return;
+    fn write_exports(&mut self) -> Result<(), Error> {
+        let exports = std::mem::take(&mut self.exports);
+        for (ref export_name, export) in exports {
+            match export {
+                ExportEntry::Definition(def) => {
+                    self.export_name_list.push(export_name.clone());
+                    self.export_def(Some(export_name), &def);
+                }
+                ExportEntry::Namespace(ns) => {
+                    let (identifier, existing) = match ns.id {
+                        Some(id) => (id, true),
+                        None => (self.generate_identifier(export_name), false),
+                    };
+                    let ns_dst = self.write_namespace(&identifier, &ns.ns, existing)?;
+                    let ts_dst = if self.config.typescript {
+                        Self::write_namespace_ts(&ns.ns, "")?
+                    } else {
+                        String::new()
+                    };
+                    let definition = if !existing {
+                        format!("const {identifier} = {{}};\n{ns_dst}")
+                    } else {
+                        self.global(&ns_dst);
+                        "".to_string()
+                    };
+                    let ts_definition = format!("let {identifier}: {ts_dst};\n");
+                    self.export_def(
+                        Some(export_name),
+                        &ExportDefinition {
+                            comments: None,
+                            definition,
+                            ts_comments: None,
+                            ts_definition,
+                            identifier,
+                            private: false,
+                        },
+                    );
+                }
+            }
         }
-        self.expose_global_heap();
-        self.expose_global_heap_next();
+        Ok(())
+    }
 
+    fn write_namespace(
+        &mut self,
+        name: &str,
+        namespace: &BTreeMap<String, ExportEntry>,
+        existing: bool,
+    ) -> Result<String, Error> {
+        let mut output = String::new();
+        for (key, entry) in namespace {
+            let full_name = if is_valid_ident(key) {
+                format!("{name}.{key}")
+            } else {
+                format!("{name}['{key}']")
+            };
+            match entry {
+                ExportEntry::Namespace(ns) => {
+                    output.push_str(&format!(
+                        "{full_name} {}= {{}};\n",
+                        if existing { "||" } else { "" }
+                    ));
+                    output.push_str(&self.write_namespace(&full_name, &ns.ns, existing)?);
+                }
+                ExportEntry::Definition(def) => {
+                    self.export_def(None, def);
+                    output.push_str(&format!("{full_name} = {};\n", def.identifier));
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn write_namespace_ts(
+        namespace: &BTreeMap<String, ExportEntry>,
+        indent: &str,
+    ) -> Result<String, Error> {
+        let mut ts_dst = String::from("{\n");
+        for (name, entry) in namespace {
+            let indent = format!("  {indent}");
+            let entry_ts = match entry {
+                ExportEntry::Namespace(ns) => Self::write_namespace_ts(&ns.ns, &indent)?,
+                ExportEntry::Definition(def) => format!("typeof {}", def.identifier),
+            };
+            if is_valid_ident(name) {
+                ts_dst.push_str(&format!("{indent}{name}: {entry_ts},\n"));
+            } else {
+                ts_dst.push_str(&format!("{indent}'{name}': {entry_ts},\n"));
+            }
+        }
+        ts_dst.push_str(&format!("{indent}}}"));
+        Ok(ts_dst)
+    }
+
+    fn expose_drop_ref(&mut self) {
         // Note that here we check if `idx` shouldn't actually be dropped. This
         // is due to the fact that `JsValue::null()` and friends can be passed
         // by value to JS where we'll automatically call this method. Those
@@ -1333,287 +1673,222 @@ __wbg_set_wasm(wasm);"
         //
         // Otherwise the free operation here is pretty simple, just appending to
         // the linked list of heap slots that are free.
-        self.global(&format!(
-            "
-            function dropObject(idx) {{
-                if (idx < {}) return;
-                heap[idx] = heap_next;
-                heap_next = idx;
-            }}
-            ",
-            INITIAL_HEAP_OFFSET + INITIAL_HEAP_VALUES.len(),
-        ));
+        self.expose_global_heap();
+        self.expose_global_heap_next();
+        intrinsic(&mut self.intrinsics, "drop_ref".into(), || {
+            format!(
+                "
+                function dropObject(idx) {{
+                    if (idx < {}) return;
+                    heap[idx] = heap_next;
+                    heap_next = idx;
+                }}
+                ",
+                INITIAL_HEAP_OFFSET + INITIAL_HEAP_VALUES.len(),
+            )
+            .into()
+        });
     }
 
     fn expose_global_heap(&mut self) {
-        if !self.should_write_global("heap") {
-            return;
-        }
         assert!(!self.config.externref);
-        self.global(&format!(
-            "const heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);"
-        ));
-        self.global(&format!("heap.push({});", INITIAL_HEAP_VALUES.join(", ")));
+        intrinsic(&mut self.intrinsics, "heap".into(), || {
+            format!(
+                "
+                let heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);
+                heap.push({});
+                ",
+                INITIAL_HEAP_VALUES.join(", ")
+            )
+            .into()
+        });
     }
 
     fn expose_global_heap_next(&mut self) {
-        if !self.should_write_global("heap_next") {
-            return;
-        }
         self.expose_global_heap();
-        self.global("let heap_next = heap.length;");
+        intrinsic(&mut self.intrinsics, "heap_next".into(), || {
+            "\nlet heap_next = heap.length;\n".into()
+        });
     }
 
     fn expose_get_object(&mut self) {
-        if !self.should_write_global("get_object") {
-            return;
-        }
-        self.expose_global_heap();
-
         // Accessing a heap object is just a simple index operation due to how
         // the stack/heap are laid out.
-        self.global("function getObject(idx) { return heap[idx]; }");
+        self.expose_global_heap();
+        intrinsic(&mut self.intrinsics, "get_object".into(), || {
+            "\nfunction getObject(idx) { return heap[idx]; }\n".into()
+        });
     }
 
     fn expose_not_defined(&mut self) {
-        if !self.should_write_global("not_defined") {
-            return;
-        }
-        self.global("function notDefined(what) { return () => { throw new Error(`${what} is not defined`); }; }");
+        intrinsic(&mut self.intrinsics, "not_defined".into(), || {
+            "\nfunction notDefined(what) { return () => { throw new Error(`${what} is not defined`); }; }\n".into()
+        });
     }
 
     fn expose_assert_num(&mut self) {
-        if !self.should_write_global("assert_num") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_num".into(), || {
             "
             function _assertNum(n) {
                 if (typeof(n) !== 'number') throw new Error(`expected a number argument, found ${typeof(n)}`);
             }
-            ",
-        );
+            ".into()
+        });
     }
 
     fn expose_assert_bigint(&mut self) {
-        if !self.should_write_global("assert_bigint") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_bigint".into(), || {
             "
             function _assertBigInt(n) {
                 if (typeof(n) !== 'bigint') throw new Error(`expected a bigint argument, found ${typeof(n)}`);
             }
-            ",
-        );
+            ".into()
+        });
     }
 
     fn expose_assert_bool(&mut self) {
-        if !self.should_write_global("assert_bool") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_bool".into(), || {
             "
             function _assertBoolean(n) {
                 if (typeof(n) !== 'boolean') {
                     throw new Error(`expected a boolean argument, found ${typeof(n)}`);
                 }
             }
-            ",
-        );
+            "
+            .into()
+        });
     }
 
     fn expose_wasm_vector_len(&mut self) {
-        if !self.should_write_global("wasm_vector_len") {
-            return;
-        }
-        self.global("let WASM_VECTOR_LEN = 0;");
+        intrinsic(&mut self.intrinsics, "wasm_vector_len".into(), || {
+            "\nlet WASM_VECTOR_LEN = 0;\n".into()
+        });
     }
 
-    fn expose_pass_string_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_string_to_wasm(&mut self, memory: MemoryId) -> MemView {
         self.expose_wasm_vector_len();
-
-        let debug = if self.config.debug {
-            "
-                if (typeof(arg) !== 'string') throw new Error(`expected a string argument, found ${typeof(arg)}`);
-            "
-        } else {
-            ""
-        };
-
         let mem = self.expose_uint8_memory(memory);
         let ret = MemView {
             name: "passStringToWasm".into(),
             num: mem.num,
         };
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
-        self.expose_text_encoder()?;
-
-        // The first implementation we have for this is to use
-        // `TextEncoder#encode` which has been around for quite some time.
-        let encode = "function (arg, view) {
-            const buf = cachedTextEncoder.encode(arg);
-            view.set(buf);
-            return {
-                read: arg.length,
-                written: buf.length
-            };
-        }";
-
-        // Another possibility is to use `TextEncoder#encodeInto` which is much
-        // newer and isn't implemented everywhere yet. It's more efficient,
-        // however, because it allows us to elide an intermediate allocation.
-        let encode_into = "function (arg, view) {
-            return cachedTextEncoder.encodeInto(arg, view);
-        }";
-
-        // Looks like `encodeInto` doesn't currently work when the memory passed
-        // in is backed by a `SharedArrayBuffer`, so force usage of `encode` if
-        // a `SharedArrayBuffer` is in use.
-        let shared = self.module.memories.get(memory).shared;
-
-        match self.config.encode_into {
-            EncodeInto::Always if !shared => {
-                self.global(&format!(
-                    "
-                    const encodeString = {encode_into};
-                "
-                ));
-            }
-            EncodeInto::Test if !shared => {
-                self.global(&format!(
-                    "
-                    const encodeString = (typeof cachedTextEncoder.encodeInto === 'function'
-                        ? {encode_into}
-                        : {encode});
-                "
-                ));
-            }
-            _ => {
-                self.global(&format!(
-                    "
-                    const encodeString = {encode};
-                "
-                ));
-            }
-        }
-
-        // A fast path that directly writes char codes into Wasm memory as long
-        // as it finds only ASCII characters.
-        //
-        // This is much faster for common ASCII strings because it can avoid
-        // calling out into C++ TextEncoder code.
-        //
-        // This might be not very intuitive, but such calls are usually more
-        // expensive in mainstream engines than staying in the JS, and
-        // charCodeAt on ASCII strings is usually optimised to raw bytes.
-        let encode_as_ascii = format!(
-            "\
-                if (realloc === undefined) {{
-                    const buf = cachedTextEncoder.encode(arg);
-                    const ptr = malloc(buf.length, 1) >>> 0;
-                    {mem}().subarray(ptr, ptr + buf.length).set(buf);
-                    WASM_VECTOR_LEN = buf.length;
-                    return ptr;
-                }}
-
-                let len = arg.length;
-                let ptr = malloc(len, 1) >>> 0;
-
-                const mem = {mem}();
-
-                let offset = 0;
-
-                for (; offset < len; offset++) {{
-                    const code = arg.charCodeAt(offset);
-                    if (code > 0x7F) break;
-                    mem[ptr + offset] = code;
-                }}
-            ",
-        );
-
-        self.global(&format!(
-            "function {name}(arg, malloc, realloc) {{
-                {debug}
-                {ascii}
-                if (offset !== len) {{
-                    if (offset !== 0) {{
-                        arg = arg.slice(offset);
-                    }}
-                    ptr = realloc(ptr, len, len = offset + arg.length * 3, 1) >>> 0;
-                    const view = {mem}().subarray(ptr + offset, ptr + len);
-                    const ret = encodeString(arg, view);
-                    {debug_end}
-                    offset += ret.written;
-                    ptr = realloc(ptr, len, offset, 1) >>> 0;
-                }}
-
-                WASM_VECTOR_LEN = offset;
-                return ptr;
-            }}",
-            name = ret,
-            debug = debug,
-            ascii = encode_as_ascii,
-            mem = mem,
-            debug_end = if self.config.debug {
-                "if (ret.read !== arg.length) throw new Error('failed to pass whole string');"
+        self.expose_text_encoder(memory);
+        intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+            let debug = if self.config.debug {
+                "if (typeof(arg) !== 'string') throw new Error(`expected a string argument, found ${typeof(arg)}`);\n"
             } else {
                 ""
-            },
-        ));
+            };
 
-        Ok(ret)
+            // A fast path that directly writes char codes into Wasm memory as long
+            // as it finds only ASCII characters.
+            //
+            // This is much faster for common ASCII strings because it can avoid
+            // calling out into C++ TextEncoder code.
+            //
+            // This might be not very intuitive, but such calls are usually more
+            // expensive in mainstream engines than staying in the JS, and
+            // charCodeAt on ASCII strings is usually optimised to raw bytes.
+            let encode_as_ascii = format!(
+                "\
+                    if (realloc === undefined) {{
+                        const buf = cachedTextEncoder.encode(arg);
+                        const ptr = malloc(buf.length, 1) >>> 0;
+                        {mem}().subarray(ptr, ptr + buf.length).set(buf);
+                        WASM_VECTOR_LEN = buf.length;
+                        return ptr;
+                    }}
+
+                    let len = arg.length;
+                    let ptr = malloc(len, 1) >>> 0;
+
+                    const mem = {mem}();
+
+                    let offset = 0;
+
+                    for (; offset < len; offset++) {{
+                        const code = arg.charCodeAt(offset);
+                        if (code > 0x7F) break;
+                        mem[ptr + offset] = code;
+                    }}
+                ",
+            );
+
+            format!(
+                "
+                function {ret}(arg, malloc, realloc) {{
+                    {debug}{encode_as_ascii}if (offset !== len) {{
+                        if (offset !== 0) {{
+                            arg = arg.slice(offset);
+                        }}
+                        ptr = realloc(ptr, len, len = offset + arg.length * 3, 1) >>> 0;
+                        const view = {mem}().subarray(ptr + offset, ptr + len);
+                        const ret = cachedTextEncoder.encodeInto(arg, view);
+                        {debug_end}
+                        offset += ret.written;
+                        ptr = realloc(ptr, len, offset, 1) >>> 0;
+                    }}
+
+                    WASM_VECTOR_LEN = offset;
+                    return ptr;
+                }}
+                ",
+                debug_end = if self.config.debug {
+                    "if (ret.read !== arg.length) throw new Error('failed to pass whole string');"
+                } else {
+                    ""
+                },
+            )
+            .into()
+        });
+        ret
     }
 
-    fn expose_pass_array8_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array8_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_uint8_memory(memory);
         self.pass_array_to_wasm("passArray8ToWasm", view, 1)
     }
 
-    fn expose_pass_array16_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array16_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_uint16_memory(memory);
         self.pass_array_to_wasm("passArray16ToWasm", view, 2)
     }
 
-    fn expose_pass_array32_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array32_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_uint32_memory(memory);
         self.pass_array_to_wasm("passArray32ToWasm", view, 4)
     }
 
-    fn expose_pass_array64_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array64_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_uint64_memory(memory);
         self.pass_array_to_wasm("passArray64ToWasm", view, 8)
     }
 
-    fn expose_pass_array_f32_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array_f32_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_f32_memory(memory);
         self.pass_array_to_wasm("passArrayF32ToWasm", view, 4)
     }
 
-    fn expose_pass_array_f64_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array_f64_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let view = self.expose_f64_memory(memory);
         self.pass_array_to_wasm("passArrayF64ToWasm", view, 8)
     }
 
-    fn expose_pass_array_jsvalue_to_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_pass_array_jsvalue_to_wasm(&mut self, memory: MemoryId) -> MemView {
         let mem = self.expose_dataview_memory(memory);
         let ret = MemView {
             name: "passArrayJsValueToWasm".into(),
             num: mem.num,
         };
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
         self.expose_wasm_vector_len();
         match (self.aux.externref_table, self.aux.externref_alloc) {
             (Some(table), Some(alloc)) => {
                 // TODO: using `addToExternrefTable` goes back and forth between wasm
                 // and JS a lot, we should have a bulk operation for this.
-                let add = self.expose_add_to_externref_table(table, alloc)?;
-                self.global(&format!(
-                    "
+                let add = self.expose_add_to_externref_table(table, alloc);
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
                         function {ret}(array, malloc) {{
                             const ptr = malloc(array.length * 4, 4) >>> 0;
                             for (let i = 0; i < array.length; i++) {{
@@ -1624,12 +1899,15 @@ __wbg_set_wasm(wasm);"
                             return ptr;
                         }}
                     ",
-                ));
+                    )
+                    .into()
+                });
             }
             _ => {
                 self.expose_add_heap_object();
-                self.global(&format!(
-                    "
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
                         function {ret}(array, malloc) {{
                             const ptr = malloc(array.length * 4, 4) >>> 0;
                             const mem = {mem}();
@@ -1640,185 +1918,232 @@ __wbg_set_wasm(wasm);"
                             return ptr;
                         }}
                     ",
-                ));
+                    )
+                    .into()
+                });
             }
         }
-        Ok(ret)
+        ret
     }
 
-    fn pass_array_to_wasm(
-        &mut self,
-        name: &'static str,
-        view: MemView,
-        size: usize,
-    ) -> Result<MemView, Error> {
+    fn pass_array_to_wasm(&mut self, name: &'static str, view: MemView, size: usize) -> MemView {
         let ret = MemView {
             name: name.into(),
             num: view.num,
         };
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
         self.expose_wasm_vector_len();
-        self.global(&format!(
-            "
-            function {ret}(arg, malloc) {{
-                const ptr = malloc(arg.length * {size}, {size}) >>> 0;
-                {view}().set(arg, ptr / {size});
-                WASM_VECTOR_LEN = arg.length;
-                return ptr;
-            }}
-            "
-        ));
-        Ok(ret)
-    }
-
-    fn expose_symbol_dispose(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("symbol_dispose") {
-            return Ok(());
-        }
-        self.global("if(!Symbol.dispose) { Symbol.dispose = Symbol('Symbol.dispose'); }");
-        Ok(())
-    }
-
-    fn expose_text_encoder(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("text_encoder") {
-            return Ok(());
-        }
-        self.expose_text_processor("TextEncoder", "encode", "('utf-8')", None)
-    }
-
-    fn expose_text_decoder(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("text_decoder") {
-            return Ok(());
-        }
-
-        // This is needed to workaround a bug in Safari
-        // See: https://github.com/rustwasm/wasm-bindgen/issues/1825
-        let init = Some("cachedTextDecoder.decode();");
-
-        // `ignoreBOM` is needed so that the BOM will be preserved when sending a string from Rust to JS
-        // `fatal` is needed to catch any weird encoding bugs when sending a string from Rust to JS
-        self.expose_text_processor(
-            "TextDecoder",
-            "decode",
-            "('utf-8', { ignoreBOM: true, fatal: true })",
-            init,
-        )?;
-
-        Ok(())
-    }
-
-    fn expose_text_processor(
-        &mut self,
-        s: &str,
-        op: &str,
-        args: &str,
-        init: Option<&str>,
-    ) -> Result<(), Error> {
-        match &self.config.mode {
-            OutputMode::Node { .. } => {
-                let name = self.import_name(&JsImport {
-                    name: JsImportName::Module {
-                        module: "util".to_string(),
-                        name: s.to_string(),
-                    },
-                    fields: Vec::new(),
-                })?;
-                self.global(&format!("let cached{s} = new {name}{args};"));
-            }
-            OutputMode::Bundler {
-                browser_only: false,
-            } => {
-                self.global(&format!(
-                    "
-                    const l{s} = typeof {s} === 'undefined' ? \
-                        (0, module.require)('util').{s} : {s};\
+        intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+            format!(
                 "
-                ));
-                self.global(&format!("let cached{s} = new l{s}{args};"));
-            }
-            OutputMode::Deno
-            | OutputMode::Web
-            | OutputMode::NoModules { .. }
-            | OutputMode::Bundler { browser_only: true } => {
-                self.global(&format!("const cached{s} = (typeof {s} !== 'undefined' ? new {s}{args} : {{ {op}: () => {{ throw Error('{s} not available') }} }} );"))
-            }
-        };
+                function {ret}(arg, malloc) {{
+                    const ptr = malloc(arg.length * {size}, {size}) >>> 0;
+                    {view}().set(arg, ptr / {size});
+                    WASM_VECTOR_LEN = arg.length;
+                    return ptr;
+                }}
+                "
+            )
+            .into()
+        });
+        ret
+    }
 
-        if let Some(init) = init {
-            match &self.config.mode {
-                OutputMode::Node { .. }
-                | OutputMode::Bundler {
-                    browser_only: false,
-                } => self.global(init),
-                OutputMode::Deno
-                | OutputMode::Web
-                | OutputMode::NoModules { .. }
-                | OutputMode::Bundler { browser_only: true } => {
-                    self.global(&format!("if (typeof {s} !== 'undefined') {{ {init} }};"))
+    fn expose_text_encoder(&mut self, memory: MemoryId) {
+        intrinsic(&mut self.intrinsics, "text_encoder".into(), || {
+            let mut dst =
+                Self::write_text_processor(self.module, memory, "const", "TextEncoder", "()", None);
+
+            let polyfill_encode_into = "cachedTextEncoder.encodeInto = function (arg, view) {
+                const buf = cachedTextEncoder.encode(arg);
+                view.set(buf);
+                return {
+                    read: arg.length,
+                    written: buf.length
+                };
+            };";
+
+            // `encodeInto` doesn't currently work in any browsers when the memory passed
+            // in is backed by a `SharedArrayBuffer`, so force usage of `encode` if
+            // a `SharedArrayBuffer` is in use.
+            let shared = self.module.memories.get(memory).shared;
+
+            match self.config.encode_into {
+                EncodeInto::Always if !shared => {}
+                EncodeInto::Test if !shared => {
+                    dst.push_str(&format!(
+                        "
+                        if (!('encodeInto' in cachedTextEncoder)) {{
+                            {polyfill_encode_into}
+                        }}
+                        "
+                    ));
+                }
+                _ => {
+                    // Support audio worklets when able to spawn them.
+                    if shared {
+                        dst.push_str(&format!(
+                            "
+                            if (cachedTextEncoder) {{
+                                {polyfill_encode_into}
+                            }}
+                            "
+                        ));
+                    } else {
+                        dst.push_str(polyfill_encode_into);
+                    }
                 }
             }
-        }
 
-        Ok(())
+            dst.into()
+        });
     }
 
-    fn expose_get_string_from_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
-        self.expose_text_decoder()?;
+    fn expose_text_decoder(&mut self, mem: &MemView, memory: MemoryId) {
+        intrinsic(&mut self.intrinsics, "text_decoder".into(), || {
+            // This is needed to workaround a bug in Safari
+            // See: https://github.com/wasm-bindgen/wasm-bindgen/issues/1825
+            let init = Some("cachedTextDecoder.decode();");
+
+            // `ignoreBOM` is needed so that the BOM will be preserved when sending a string from Rust to JS
+            // `fatal` is needed to catch any weird encoding bugs when sending a string from Rust to JS
+            let mut dst = Self::write_text_processor(
+                self.module,
+                memory,
+                "let",
+                "TextDecoder",
+                "('utf-8', { ignoreBOM: true, fatal: true })",
+                init,
+            );
+
+            // Typically we try to give a raw view of memory out to `TextDecoder` to
+            // avoid copying too much data. If, however, a `SharedArrayBuffer` is
+            // being used it looks like that is rejected by `TextDecoder` or
+            // otherwise doesn't work with it. When we detect a shared situation we
+            // use `slice` which creates a new array instead of `subarray` which
+            // creates just a view. That way in shared mode we copy more data but in
+            // non-shared mode there's no need to copy the data except for the
+            // string itself.
+            let is_shared = self.module.memories.get(memory).shared;
+            let method = if is_shared { "slice" } else { "subarray" };
+            let text_decoder_decode =
+                format!("cachedTextDecoder.decode({mem}().{method}(ptr, ptr + len))");
+
+            match &self.config.mode {
+                OutputMode::Bundler { .. } | OutputMode::Web => {
+                    // For targets that can run in a browser, we need a workaround for the fact that
+                    // (at least) Safari 16 to 18 has a TextDecoder that can't decode anymore after
+                    // processing 2GiB of data. The workaround is that we keep track of how much the
+                    // decoder has decoded and just create a new decoder when we're getting close to
+                    // the limit.
+                    // See MAX_SAFARI_DECODE_BYTES below for link to bug report.
+
+                    // Maximum number of bytes Safari can handle for one TextDecoder is 2GiB (0x80000000 bytes)
+                    // but empirically it seems to crash a bit before the end, so we remove 1MiB (0x100000 bytes)
+                    // of margin.
+                    // Workaround for a bug in Safari.
+                    // See https://github.com/rustwasm/wasm-bindgen/issues/4471
+                    const MAX_SAFARI_DECODE_BYTES: u32 = 0x80000000 - 0x100000;
+                    dst.push_str(&format!(
+                    "
+                    const MAX_SAFARI_DECODE_BYTES = {MAX_SAFARI_DECODE_BYTES};
+                    let numBytesDecoded = 0;
+                    function decodeText(ptr, len) {{
+                        numBytesDecoded += len;
+                        if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {{
+                            cachedTextDecoder = new TextDecoder('utf-8', {{ ignoreBOM: true, fatal: true }});
+                            cachedTextDecoder.decode();
+                            numBytesDecoded = len;
+                        }}
+                        return {text_decoder_decode};
+                    }}
+                    ",
+                ));
+                }
+                _ => {
+                    // For any non-browser target, we can just use the TextDecoder without any workarounds.
+                    // For browser-targets, see the workaround for Safari above.
+                    dst.push_str(&format!(
+                        "
+                        function decodeText(ptr, len) {{
+                            return {text_decoder_decode};
+                        }}
+                        ",
+                    ));
+                }
+            }
+
+            dst.into()
+        })
+    }
+
+    fn write_text_processor(
+        module: &walrus::Module,
+        memory: MemoryId,
+        decl_kind: &str,
+        s: &str,
+        args: &str,
+        init: Option<&str>,
+    ) -> String {
+        let mut dst = String::new();
+        // Audio worklets don't support `TextDe/Encoder`. When using audio worklets directly,
+        // users will have to make sure themselves not to use any corresponding APIs. But
+        // when spawning audio worklets, its fine to have `TextDe/Encoder` in a "normal worker"
+        // while not using corresponding APIs in the audio worklet itself.
+        if module.memories.get(memory).shared {
+            dst.push_str(&format!(
+                "{decl_kind} cached{s} = (typeof {s} !== 'undefined' ? new {s}{args} : undefined);\n"
+            ));
+
+            if let Some(init) = init {
+                dst.push_str(&format!("if (cached{s}) {init}\n"));
+            }
+        } else {
+            dst.push_str(&format!("{decl_kind} cached{s} = new {s}{args};\n"));
+
+            if let Some(init) = init {
+                dst.push_str(init);
+            }
+        }
+        dst
+    }
+
+    fn expose_get_string_from_wasm(&mut self, memory: MemoryId) -> MemView {
         let mem = self.expose_uint8_memory(memory);
+        self.expose_text_decoder(&mem, memory);
         let ret = MemView {
             name: "getStringFromWasm".into(),
             num: mem.num,
         };
-
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
-
-        // Typically we try to give a raw view of memory out to `TextDecoder` to
-        // avoid copying too much data. If, however, a `SharedArrayBuffer` is
-        // being used it looks like that is rejected by `TextDecoder` or
-        // otherwise doesn't work with it. When we detect a shared situation we
-        // use `slice` which creates a new array instead of `subarray` which
-        // creates just a view. That way in shared mode we copy more data but in
-        // non-shared mode there's no need to copy the data except for the
-        // string itself.
-        let is_shared = self.module.memories.get(memory).shared;
-        let method = if is_shared { "slice" } else { "subarray" };
-
-        self.global(&format!(
-            "
-            function {ret}(ptr, len) {{
-                ptr = ptr >>> 0;
-                return cachedTextDecoder.decode({mem}().{method}(ptr, ptr + len));
-            }}
-            "
-        ));
-        Ok(ret)
+        intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+            format!(
+                "
+                function {ret}(ptr, len) {{
+                    ptr = ptr >>> 0;
+                    return decodeText(ptr, len);
+                }}
+                ",
+            )
+            .into()
+        });
+        ret
     }
 
     fn expose_get_cached_string_from_wasm(
         &mut self,
         memory: MemoryId,
         table: Option<TableId>,
-    ) -> Result<MemView, Error> {
+    ) -> MemView {
         let get_object = if let Some(table) = table {
-            self.expose_get_from_externref_table(table)?.to_string()
+            self.expose_get_from_externref_table(table).to_string()
         } else {
             self.expose_get_object();
             "getObject".to_string()
         };
-        let get_string = self.expose_get_string_from_wasm(memory)?;
+        let get_string = self.expose_get_string_from_wasm(memory);
         let ret = MemView {
             name: "getCachedStringFromWasm".into(),
             num: get_string.num,
         };
-
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
-
         // This has support for both `&str` and `Option<&str>`.
         //
         // If `ptr` is not `0` then we know that it's a `&str` or `Some(&str)`, so we just decode it.
@@ -1827,66 +2152,123 @@ __wbg_set_wasm(wasm);"
         //
         // If `ptr` and `len` are both `0` then that means it's `None`, in that case we rely upon
         // the fact that `getObject(0)` is guaranteed to be `undefined`.
-        self.global(&format!(
-            "
-            function {ret}(ptr, len) {{
-                if (ptr === 0) {{
-                    return {get_object}(len);
-                }} else {{
-                    return {get_string}(ptr, len);
+        intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+            format!(
+                "
+                function {ret}(ptr, len) {{
+                    if (ptr === 0) {{
+                        return {get_object}(len);
+                    }} else {{
+                        return {get_string}(ptr, len);
+                    }}
                 }}
-            }}
-            "
-        ));
-        Ok(ret)
+                "
+            )
+            .into()
+        });
+        ret
     }
 
-    fn expose_get_array_js_value_from_wasm(&mut self, memory: MemoryId) -> Result<MemView, Error> {
+    fn expose_get_array_js_value_from_wasm(&mut self, memory: MemoryId) -> MemView {
         let mem = self.expose_dataview_memory(memory);
         let ret = MemView {
             name: "getArrayJsValueFromWasm".into(),
             num: mem.num,
         };
-        if !self.should_write_global(ret.to_string()) {
-            return Ok(ret);
-        }
         match (self.aux.externref_table, self.aux.externref_drop_slice) {
             (Some(table), Some(drop)) => {
                 let table = self.export_name_of(table);
                 let drop = self.export_name_of(drop);
-                self.global(&format!(
-                    "
-                    function {ret}(ptr, len) {{
-                        ptr = ptr >>> 0;
-                        const mem = {mem}();
-                        const result = [];
-                        for (let i = ptr; i < ptr + 4 * len; i += 4) {{
-                            result.push(wasm.{table}.get(mem.getUint32(i, true)));
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
+                        function {ret}(ptr, len) {{
+                            ptr = ptr >>> 0;
+                            const mem = {mem}();
+                            const result = [];
+                            for (let i = ptr; i < ptr + 4 * len; i += 4) {{
+                                result.push(wasm.{table}.get(mem.getUint32(i, true)));
+                            }}
+                            wasm.{drop}(ptr, len);
+                            return result;
                         }}
-                        wasm.{drop}(ptr, len);
-                        return result;
-                    }}
-                    ",
-                ));
+                        ",
+                    )
+                    .into()
+                });
             }
             _ => {
                 self.expose_take_object();
-                self.global(&format!(
-                    "
-                    function {ret}(ptr, len) {{
-                        ptr = ptr >>> 0;
-                        const mem = {mem}();
-                        const result = [];
-                        for (let i = ptr; i < ptr + 4 * len; i += 4) {{
-                            result.push(takeObject(mem.getUint32(i, true)));
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
+                        function {ret}(ptr, len) {{
+                            ptr = ptr >>> 0;
+                            const mem = {mem}();
+                            const result = [];
+                            for (let i = ptr; i < ptr + 4 * len; i += 4) {{
+                                result.push(takeObject(mem.getUint32(i, true)));
+                            }}
+                            return result;
                         }}
-                        return result;
-                    }}
-                    ",
-                ));
+                        ",
+                    )
+                    .into()
+                });
             }
         }
-        Ok(ret)
+        ret
+    }
+
+    /// Like `expose_get_array_js_value_from_wasm` but for borrowed slices.
+    /// Uses `getObject` instead of `takeObject` and doesn't drop the heap entries.
+    fn expose_get_array_js_value_view_from_wasm(&mut self, memory: MemoryId) -> MemView {
+        let mem = self.expose_dataview_memory(memory);
+        let ret = MemView {
+            name: "getArrayJsValueViewFromWasm".into(),
+            num: mem.num,
+        };
+        match self.aux.externref_table {
+            Some(table) => {
+                let table = self.export_name_of(table);
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
+                        function {ret}(ptr, len) {{
+                            ptr = ptr >>> 0;
+                            const mem = {mem}();
+                            const result = [];
+                            for (let i = ptr; i < ptr + 4 * len; i += 4) {{
+                                result.push(wasm.{table}.get(mem.getUint32(i, true)));
+                            }}
+                            return result;
+                        }}
+                        ",
+                    )
+                    .into()
+                });
+            }
+            _ => {
+                self.expose_get_object();
+                intrinsic(&mut self.intrinsics, ret.to_string().into(), || {
+                    format!(
+                        "
+                        function {ret}(ptr, len) {{
+                            ptr = ptr >>> 0;
+                            const mem = {mem}();
+                            const result = [];
+                            for (let i = ptr; i < ptr + 4 * len; i += 4) {{
+                                result.push(getObject(mem.getUint32(i, true)));
+                            }}
+                            return result;
+                        }}
+                        ",
+                    )
+                    .into()
+                });
+            }
+        }
+        ret
     }
 
     fn expose_get_array_i8_from_wasm(&mut self, memory: MemoryId) -> MemView {
@@ -1949,17 +2331,17 @@ __wbg_set_wasm(wasm);"
             name: name.into(),
             num: view.num,
         };
-        if !self.should_write_global(name) {
-            return ret;
-        }
-        self.global(&format!(
-            "
-            function {ret}(ptr, len) {{
-                ptr = ptr >>> 0;
-                return {view}().subarray(ptr / {size}, ptr / {size} + len);
-            }}
-            ",
-        ));
+        intrinsic(&mut self.intrinsics, name.into(), || {
+            format!(
+                "
+                function {ret}(ptr, len) {{
+                    ptr = ptr >>> 0;
+                    return {view}().subarray(ptr / {size}, ptr / {size} + len);
+                }}
+                ",
+            )
+            .into()
+        });
         ret
     }
 
@@ -2013,40 +2395,37 @@ __wbg_set_wasm(wasm);"
 
     fn memview(&mut self, kind: &'static str, memory: walrus::MemoryId) -> MemView {
         let view = self.memview_memory(kind, memory);
-        if !self.should_write_global(view.name.clone()) {
-            return view;
-        }
         let mem = self.export_name_of(memory);
-
-        let cache = format!("cached{}Memory{}", kind, view.num);
-        let resized_check = if self.module.memories.get(memory).shared {
-            // When it's backed by a `SharedArrayBuffer`, growing the Wasm module's memory
-            // doesn't detach old references; instead, it just leaves them pointing to a
-            // slice of the up-to-date memory. So in order to check if it's been grown, we
-            // have to compare it to the up-to-date buffer.
-            format!("{cache}.buffer !== wasm.{mem}.buffer")
-        } else if kind == "DataView" {
-            // `DataView`s throw when accessing detached memory, including `byteLength`.
-            // However this requires JS engine support, so we fallback to comparing the buffer.
-            format!("{cache}.buffer.detached === true || ({cache}.buffer.detached === undefined && {cache}.buffer !== wasm.{mem}.buffer)")
-        } else {
-            // Otherwise, we can do a quicker check of whether the buffer's been detached,
-            // which is indicated by a length of 0.
-            format!("{cache}.byteLength === 0")
-        };
-
-        self.global(&format!("let {cache} = null;\n"));
-
-        self.global(&format!(
-            "
-            function {view}() {{
-                if ({cache} === null || {resized_check}) {{
-                    {cache} = new {kind}(wasm.{mem}.buffer);
+        intrinsic(&mut self.intrinsics, view.name.to_string().into(), || {
+            let cache = format!("cached{kind}Memory{}", view.num);
+            let resized_check = if self.module.memories.get(memory).shared {
+                // When it's backed by a `SharedArrayBuffer`, growing the Wasm module's memory
+                // doesn't detach old references; instead, it just leaves them pointing to a
+                // slice of the up-to-date memory. So in order to check if it's been grown, we
+                // have to compare it to the up-to-date buffer.
+                format!("{cache}.buffer !== wasm.{mem}.buffer")
+            } else if kind == "DataView" {
+                // `DataView`s throw when accessing detached memory, including `byteLength`.
+                // However this requires JS engine support, so we fallback to comparing the buffer.
+                format!("{cache}.buffer.detached === true || ({cache}.buffer.detached === undefined && {cache}.buffer !== wasm.{mem}.buffer)")
+            } else {
+                // Otherwise, we can do a quicker check of whether the buffer's been detached,
+                // which is indicated by a length of 0.
+                format!("{cache}.byteLength === 0")
+            };
+            format!(
+                "
+                let {cache} = null;
+                function {view}() {{
+                    if ({cache} === null || {resized_check}) {{
+                        {cache} = new {kind}(wasm.{mem}.buffer);
+                    }}
+                    return {cache};
                 }}
-                return {cache};
-            }}
-            ",
-        ));
+                ",
+            )
+            .into()
+        });
         view
     }
 
@@ -2073,31 +2452,25 @@ __wbg_set_wasm(wasm);"
     }
 
     fn expose_assert_class(&mut self) {
-        if !self.should_write_global("assert_class") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_class".into(), || {
             "
             function _assertClass(instance, klass) {
                 if (!(instance instanceof klass)) {
                     throw new Error(`expected instance of ${klass.name}`);
                 }
             }
-            ",
-        );
+            "
+            .into()
+        });
     }
 
     fn expose_global_stack_pointer(&mut self) {
-        if !self.should_write_global("stack_pointer") {
-            return;
-        }
-        self.global(&format!("let stack_pointer = {INITIAL_HEAP_OFFSET};"));
+        intrinsic(&mut self.intrinsics, "stack_pointer".into(), || {
+            format!("\nlet stack_pointer = {INITIAL_HEAP_OFFSET};\n").into()
+        });
     }
 
     fn expose_borrowed_objects(&mut self) {
-        if !self.should_write_global("borrowed_objects") {
-            return;
-        }
         self.expose_global_heap();
         self.expose_global_stack_pointer();
         // Our `stack_pointer` points to where we should start writing stack
@@ -2105,72 +2478,64 @@ __wbg_set_wasm(wasm);"
         // after executing this. Once we've reserved stack space we write the
         // value. Eventually underflow will throw an exception, but JS sort of
         // just handles it today...
-        self.global(
+        intrinsic(&mut self.intrinsics, "borrowed_objects".into(), || {
             "
             function addBorrowedObject(obj) {
                 if (stack_pointer == 1) throw new Error('out of js stack');
                 heap[--stack_pointer] = obj;
                 return stack_pointer;
             }
-            ",
-        );
+            "
+            .into()
+        });
     }
 
     fn expose_take_object(&mut self) {
-        if !self.should_write_global("take_object") {
-            return;
-        }
         self.expose_get_object();
         self.expose_drop_ref();
-        self.global(
+        intrinsic(&mut self.intrinsics, "take_object".into(), || {
             "
             function takeObject(idx) {
                 const ret = getObject(idx);
                 dropObject(idx);
                 return ret;
             }
-            ",
-        );
+            "
+            .into()
+        });
     }
 
     fn expose_add_heap_object(&mut self) {
-        if !self.should_write_global("add_heap_object") {
-            return;
-        }
         self.expose_global_heap();
         self.expose_global_heap_next();
-        let set_heap_next = if self.config.debug {
-            String::from(
-                "
-                if (typeof(heap_next) !== 'number') throw new Error('corrupt heap');
-                ",
-            )
-        } else {
-            String::new()
-        };
 
         // Allocating a slot on the heap first goes through the linked list
         // (starting at `heap_next`). Once that linked list is exhausted we'll
         // be pointing beyond the end of the array, at which point we'll reserve
         // one more slot and use that.
-        self.global(&format!(
-            "
-            function addHeapObject(obj) {{
-                if (heap_next === heap.length) heap.push(heap.length + 1);
-                const idx = heap_next;
-                heap_next = heap[idx];
-                {set_heap_next}
-                heap[idx] = obj;
-                return idx;
-            }}
-            "
-        ));
+        intrinsic(&mut self.intrinsics, "add_heap_object".into(), || {
+            format!(
+                "
+                function addHeapObject(obj) {{
+                    if (heap_next === heap.length) heap.push(heap.length + 1);
+                    const idx = heap_next;
+                    heap_next = heap[idx];
+                    {}
+                    heap[idx] = obj;
+                    return idx;
+                }}
+                ",
+                if self.config.debug {
+                    "if (typeof(heap_next) !== 'number') throw new Error('corrupt heap');"
+                } else {
+                    ""
+                }
+            )
+            .into()
+        });
     }
 
     fn expose_handle_error(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("handle_error") {
-            return Ok(());
-        }
         let store = self
             .aux
             .exn_store
@@ -2178,44 +2543,47 @@ __wbg_set_wasm(wasm);"
         let store = self.export_name_of(store);
         match (self.aux.externref_table, self.aux.externref_alloc) {
             (Some(table), Some(alloc)) => {
-                let add = self.expose_add_to_externref_table(table, alloc)?;
-                self.global(&format!(
-                    "\
-                    function handleError(f, args) {{
-                        try {{
-                            return f.apply(this, args);
-                        }} catch (e) {{
-                            const idx = {add}(e);
-                            wasm.{store}(idx);
+                let add = self.expose_add_to_externref_table(table, alloc);
+                intrinsic(&mut self.intrinsics, "handle_error".into(), || {
+                    format!(
+                        "
+                        function handleError(f, args) {{
+                            try {{
+                                return f.apply(this, args);
+                            }} catch (e) {{
+                                const idx = {add}(e);
+                                wasm.{store}(idx);
+                            }}
                         }}
-                    }}
-                    ",
-                ));
+                        ",
+                    )
+                    .into()
+                });
             }
             _ => {
                 self.expose_add_heap_object();
-                self.global(&format!(
-                    "\
-                    function handleError(f, args) {{
-                        try {{
-                            return f.apply(this, args);
-                        }} catch (e) {{
-                            wasm.{store}(addHeapObject(e));
+                intrinsic(&mut self.intrinsics, "handle_error".into(), || {
+                    format!(
+                        "
+                        function handleError(f, args) {{
+                            try {{
+                                return f.apply(this, args);
+                            }} catch (e) {{
+                                wasm.{store}(addHeapObject(e));
+                            }}
                         }}
-                    }}
-                    ",
-                ));
+                        ",
+                    )
+                    .into()
+                });
             }
         }
         Ok(())
     }
 
     fn expose_log_error(&mut self) {
-        if !self.should_write_global("log_error") {
-            return;
-        }
-        self.global(
-            "\
+        intrinsic(&mut self.intrinsics, "log_error".into(), || {
+            "
             function logError(f, args) {
                 try {
                     return f.apply(this, args);
@@ -2235,11 +2603,12 @@ __wbg_set_wasm(wasm);"
                     throw e;
                 }
             }
-            ",
-        );
+            "
+            .into()
+        });
     }
 
-    fn pass_to_wasm_function(&mut self, t: VectorKind, memory: MemoryId) -> Result<MemView, Error> {
+    fn pass_to_wasm_function(&mut self, t: VectorKind, memory: MemoryId) -> MemView {
         match t {
             VectorKind::String => self.expose_pass_string_to_wasm(memory),
             VectorKind::I8 | VectorKind::U8 | VectorKind::ClampedU8 => {
@@ -2255,13 +2624,9 @@ __wbg_set_wasm(wasm);"
         }
     }
 
-    fn expose_get_vector_from_wasm(
-        &mut self,
-        ty: VectorKind,
-        memory: MemoryId,
-    ) -> Result<MemView, Error> {
-        Ok(match ty {
-            VectorKind::String => self.expose_get_string_from_wasm(memory)?,
+    fn expose_get_vector_from_wasm(&mut self, ty: VectorKind, memory: MemoryId) -> MemView {
+        match ty {
+            VectorKind::String => self.expose_get_string_from_wasm(memory),
             VectorKind::I8 => self.expose_get_array_i8_from_wasm(memory),
             VectorKind::U8 => self.expose_get_array_u8_from_wasm(memory),
             VectorKind::ClampedU8 => self.expose_get_clamped_array_u8_from_wasm(memory),
@@ -2273,15 +2638,12 @@ __wbg_set_wasm(wasm);"
             VectorKind::U64 => self.expose_get_array_u64_from_wasm(memory),
             VectorKind::F32 => self.expose_get_array_f32_from_wasm(memory),
             VectorKind::F64 => self.expose_get_array_f64_from_wasm(memory),
-            VectorKind::Externref => self.expose_get_array_js_value_from_wasm(memory)?,
-            VectorKind::NamedExternref(_) => self.expose_get_array_js_value_from_wasm(memory)?,
-        })
+            VectorKind::Externref => self.expose_get_array_js_value_from_wasm(memory),
+            VectorKind::NamedExternref(_) => self.expose_get_array_js_value_from_wasm(memory),
+        }
     }
 
     fn expose_get_inherited_descriptor(&mut self) {
-        if !self.should_write_global("get_inherited_descriptor") {
-            return;
-        }
         // It looks like while rare some browsers will move descriptors up the
         // property chain which runs the risk of breaking wasm-bindgen-generated
         // code because we're looking for precise descriptor functions rather
@@ -2291,165 +2653,296 @@ __wbg_set_wasm(wasm);"
         // As a result we have a small helper here which will walk the prototype
         // chain looking for a descriptor. For some more information on this see
         // #109
-        self.global(
-            "
-            function GetOwnOrInheritedPropertyDescriptor(obj, id) {
-              while (obj) {
-                let desc = Object.getOwnPropertyDescriptor(obj, id);
-                if (desc) return desc;
-                obj = Object.getPrototypeOf(obj);
-              }
-              return {};
-            }
-            ",
+        intrinsic(
+            &mut self.intrinsics,
+            "get_inherited_descriptor".into(),
+            || {
+                "
+                function GetOwnOrInheritedPropertyDescriptor(obj, id) {
+                    while (obj) {
+                        let desc = Object.getOwnPropertyDescriptor(obj, id);
+                        if (desc) return desc;
+                        obj = Object.getPrototypeOf(obj);
+                    }
+                    return {};
+                }
+                "
+                .into()
+            },
         );
     }
 
     fn expose_is_like_none(&mut self) {
-        if !self.should_write_global("is_like_none") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "is_like_none".into(), || {
             "
             function isLikeNone(x) {
                 return x === undefined || x === null;
             }
-        ",
-        );
+            "
+            .into()
+        });
     }
 
     fn expose_assert_non_null(&mut self) {
-        if !self.should_write_global("assert_non_null") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_non_null".into(), || {
             "
             function _assertNonNull(n) {
                 if (typeof(n) !== 'number' || n === 0) throw new Error(`expected a number argument that is not 0, found ${n}`);
             }
-            ",
-        );
+            ".into()
+        });
     }
 
     fn expose_assert_char(&mut self) {
-        if !self.should_write_global("assert_char") {
-            return;
-        }
-        self.global(
+        intrinsic(&mut self.intrinsics, "assert_char".into(), || {
             "
             function _assertChar(c) {
                 if (typeof(c) === 'number' && (c >= 0x110000 || (c >= 0xD800 && c < 0xE000))) throw new Error(`expected a valid Unicode scalar value, found ${c}`);
             }
-            ",
-        );
+            ".into()
+        });
     }
 
-    fn expose_make_mut_closure(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("make_mut_closure") {
-            return Ok(());
-        }
-
-        let table = self.export_function_table()?;
-
-        self.expose_closure_finalization()?;
+    fn expose_make_mut_closure(&mut self) {
+        self.expose_closure_finalization();
 
         // For mutable closures they can't be invoked recursively.
         // To handle that we swap out the `this.a` pointer with zero
         // while we invoke it. If we finish and the closure wasn't
         // destroyed, then we put back the pointer so a future
         // invocation can succeed.
-        self.global(&format!(
-            "
-            function makeMutClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
-                const real = (...args) => {{
-                    // First up with a closure we increment the internal reference
-                    // count. This ensures that the Rust closure environment won't
-                    // be deallocated while we're invoking it.
-                    state.cnt++;
-                    const a = state.a;
-                    state.a = 0;
-                    try {{
-                        return f(a, state.b, ...args);
-                    }} finally {{
-                        if (--state.cnt === 0) {{
-                            wasm.{table}.get(state.dtor)(a, state.b);
-                            CLOSURE_DTORS.unregister(state);
-                        }} else {{
+        intrinsic(&mut self.intrinsics, "make_mut_closure".into(), || {
+            let safe_destructor = "\
+                state.dtor(state.a, state.b);
+                state.a = 0;
+                CLOSURE_DTORS.unregister(state);\
+                ";
+            let (state_init, instance_check) = if self.config.generate_reset_state {
+                (
+                    "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+                    "
+                    if (state.instance !== __wbg_instance_id) {
+                        throw new Error('Cannot invoke closure from previous WASM instance');
+                    }
+                    "
+                )
+            } else {
+                ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+            };
+            format!(
+                "
+                function makeMutClosure(arg0, arg1, dtor, f) {{
+                    {state_init}
+                    const real = (...args) => {{
+                        {instance_check}
+                        // First up with a closure we increment the internal reference
+                        // count. This ensures that the Rust closure environment won't
+                        // be deallocated while we're invoking it.
+                        state.cnt++;
+                        const a = state.a;
+                        state.a = 0;
+                        try {{
+                            return f(a, state.b, ...args);
+                        }} finally {{
                             state.a = a;
+                            real._wbg_cb_unref();
                         }}
-                    }}
-                }};
-                real.original = state;
-                CLOSURE_DTORS.register(real, state, state);
-                return real;
-            }}
-            ",
-        ));
-
-        Ok(())
+                    }};
+                    real._wbg_cb_unref = () => {{
+                        if (--state.cnt === 0) {{
+                            {safe_destructor}
+                        }}
+                    }};
+                    CLOSURE_DTORS.register(real, state, state);
+                    return real;
+                }}
+                "
+            )
+            .into()
+        });
     }
 
-    fn expose_make_closure(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("make_closure") {
-            return Ok(());
-        }
-
-        let table = self.export_function_table()?;
-
-        self.expose_closure_finalization()?;
+    fn expose_make_closure(&mut self) {
+        self.expose_closure_finalization();
 
         // For shared closures they can be invoked recursively so we
         // just immediately pass through `this.a`. If we end up
         // executing the destructor, however, we clear out the
         // `this.a` pointer to prevent it being used again the
         // future.
-        self.global(&format!(
-            "
-            function makeClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
-                const real = (...args) => {{
-                    // First up with a closure we increment the internal reference
-                    // count. This ensures that the Rust closure environment won't
-                    // be deallocated while we're invoking it.
-                    state.cnt++;
-                    try {{
-                        return f(state.a, state.b, ...args);
-                    }} finally {{
-                        if (--state.cnt === 0) {{
-                            wasm.{table}.get(state.dtor)(state.a, state.b);
-                            state.a = 0;
-                            CLOSURE_DTORS.unregister(state);
+        intrinsic(&mut self.intrinsics, "make_closure".into(), || {
+            let safe_destructor = "\
+                state.dtor(state.a, state.b);
+                state.a = 0;
+                CLOSURE_DTORS.unregister(state);\
+                ";
+            let (state_init, instance_check) = if self.config.generate_reset_state {
+                (
+                    "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+                    "
+                    if (state.instance !== __wbg_instance_id) {
+                        throw new Error('Cannot invoke closure from previous WASM instance');
+                    }
+                    "
+                )
+            } else {
+                ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+            };
+            format!(
+                "
+                function makeClosure(arg0, arg1, dtor, f) {{
+                    {state_init}
+                    const real = (...args) => {{
+                        {instance_check}
+                        // First up with a closure we increment the internal reference
+                        // count. This ensures that the Rust closure environment won't
+                        // be deallocated while we're invoking it.
+                        state.cnt++;
+                        try {{
+                            return f(state.a, state.b, ...args);
+                        }} finally {{
+                            real._wbg_cb_unref();
                         }}
-                    }}
-                }};
-                real.original = state;
-                CLOSURE_DTORS.register(real, state, state);
-                return real;
-            }}
-            ",
-        ));
-
-        Ok(())
+                    }};
+                    real._wbg_cb_unref = () => {{
+                        if (--state.cnt === 0) {{
+                            {safe_destructor}
+                        }}
+                    }};
+                    CLOSURE_DTORS.register(real, state, state);
+                    return real;
+                }}
+                "
+            )
+            .into()
+        });
     }
 
-    fn expose_closure_finalization(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("closure_finalization") {
-            return Ok(());
+    fn expose_closure_finalization(&mut self) {
+        intrinsic(&mut self.intrinsics, "closure_finalization".into(), || {
+            format!(
+                "
+                const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+                    ? {{ register: () => {{}}, unregister: () => {{}} }}
+                    : new FinalizationRegistry({});
+                ",
+                if self.config.generate_reset_state {
+                    "\
+                    state => {
+                        if (state.instance === __wbg_instance_id) {
+                            state.dtor(state.a, state.b);
+                        }
+                    }
+                    "
+                } else {
+                    "state => state.dtor(state.a, state.b)"
+                }
+            )
+            .into()
+        });
+    }
+
+    fn expose_panic_error(&mut self) {
+        intrinsic(&mut self.intrinsics, "panic_error".into(), || {
+            "class PanicError extends Error {}
+            Object.defineProperty(PanicError.prototype, 'name', {
+                value: PanicError.name,
+            });
+            "
+            .into()
+        });
+    }
+
+    fn generate_reset_state(&mut self) -> Result<(), Error> {
+        self.global("let __wbg_instance_id = 0;");
+
+        let mut reset_statements = Vec::new();
+        reset_statements.push("__wbg_instance_id++;".to_string());
+
+        for (num, kinds) in self.memories.values() {
+            for kind in kinds {
+                let memview_name = format!("get{kind}Memory");
+                if self.has_intrinsic(memview_name.as_str()) {
+                    reset_statements.push(format!("cached{kind}Memory{num} = null;"));
+                }
+            }
         }
-        let table = self.export_function_table()?;
-        self.global(&format!(
+
+        // Conditionally reset globals based on whether they were used
+        if self.has_intrinsic("text_decoder") {
+            reset_statements.push(
+                "if (typeof numBytesDecoded !== 'undefined') numBytesDecoded = 0;".to_string(),
+            );
+        }
+
+        if self.has_intrinsic("wasm_vector_len") {
+            reset_statements.push(
+                "if (typeof WASM_VECTOR_LEN !== 'undefined') WASM_VECTOR_LEN = 0;".to_string(),
+            );
+        }
+
+        if self.has_intrinsic("heap") {
+            let mut heap_reset = format!(
+                "\
+                    if (typeof heap !== 'undefined') {{
+                        heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);
+                        heap = heap.concat([{}]);
+                ",
+                INITIAL_HEAP_VALUES.join(", ")
+            );
+
+            if self.has_intrinsic("heap_next") {
+                heap_reset.push_str(
+                    "\
+                        if (typeof heap_next !== 'undefined')
+                            heap_next = heap.length;
+                    ",
+                );
+            }
+
+            if self.has_intrinsic("stack_pointer") {
+                heap_reset.push_str(&format!(
+                    "\
+                        if (typeof stack_pointer !== 'undefined')
+                            stack_pointer = {INITIAL_HEAP_OFFSET};
+                    "
+                ));
+            }
+
+            heap_reset.push('}');
+            reset_statements.push(heap_reset);
+        }
+
+        reset_statements.push(
             "
-            const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
-                ? {{ register: () => {{}}, unregister: () => {{}} }}
-                : new FinalizationRegistry(state => {{
-                    wasm.{table}.get(state.dtor)(state.a, state.b)
-                }});
+            const wasmInstance = new WebAssembly.Instance(wasmModule, __wbg_get_imports());
+            wasm = wasmInstance.exports;
+            wasm.__wbindgen_start();
             "
-        ));
+            .to_string(),
+        );
+
+        let function_body = format!("() {{\n{}}}", reset_statements.join("\n"));
+
+        let identifier = self.generate_identifier("__wbg_reset_state");
+        let definition = format!("function {identifier} {function_body}\n");
+        define_export(
+            &mut self.exports,
+            "__wbg_reset_state",
+            &[],
+            ExportEntry::Definition(ExportDefinition {
+                comments: None,
+                identifier,
+                definition,
+                ts_definition: "function __wbg_reset_state(): void;\n".to_string(),
+                ts_comments: None,
+                private: !self.config.generate_reset_state,
+            }),
+        )?;
 
         Ok(())
     }
+
     fn global(&mut self, s: &str) {
         let s = s.trim();
 
@@ -2462,12 +2955,22 @@ __wbg_set_wasm(wasm);"
         self.globals.push('\n');
     }
 
-    fn require_class_wrap(&mut self, name: &str) {
-        require_class(&mut self.exported_classes, name).wrap_needed = true;
+    /// Gets the JS identifier for a class, which may be aliased if the original
+    /// name conflicts with a JS builtin (e.g., `Array` -> `Array2`).
+    pub fn require_class_identifier(&mut self, name: &str) -> String {
+        self.require_class(name).identifier.clone()
     }
 
-    fn require_class_unwrap(&mut self, name: &str) {
-        require_class(&mut self.exported_classes, name).unwrap_needed = true;
+    fn require_class_wrap(&mut self, name: &str) -> String {
+        let cls = self.require_class(name);
+        cls.wrap_needed = true;
+        cls.identifier.clone()
+    }
+
+    fn require_class_unwrap(&mut self, name: &str) -> String {
+        let cls = self.require_class(name);
+        cls.unwrap_needed = true;
+        cls.identifier.clone()
     }
 
     fn add_module_import(&mut self, module: String, name: &str, actual: &str) {
@@ -2545,11 +3048,18 @@ __wbg_set_wasm(wasm);"
             }
 
             JsImportName::Global { name } => {
-                let unique_name = self.generate_identifier(name);
-                if unique_name != *name {
-                    bail!("cannot import `{}` from two locations", name);
+                // Just register the name for collision detection without modifying it.
+                // We should implement separate local / external name handling here in due course
+                // and then just use generate_identifier, but for now this retains backwards compat.
+                let cnt = self
+                    .defined_identifiers
+                    .entry(name.to_string())
+                    .or_insert(0);
+                *cnt += 1;
+                if *cnt > 1 {
+                    bail!("cannot import `{name}` from two locations");
                 }
-                unique_name
+                name.to_string()
             }
         };
         self.imported_names
@@ -2587,95 +3097,70 @@ __wbg_set_wasm(wasm);"
         Ok(name)
     }
 
-    /// If a start function is present, it removes it from the `start` section
-    /// of the Wasm module and then moves it to an exported function, named
-    /// `__wbindgen_start`.
-    fn unstart_start_function(&mut self) -> bool {
-        let start = match self.module.start.take() {
-            Some(id) => id,
-            None => return false,
-        };
-        self.module.exports.add("__wbindgen_start", start);
-        true
-    }
-
-    fn expose_get_from_externref_table(&mut self, table: TableId) -> Result<MemView, Error> {
+    fn expose_get_from_externref_table(&mut self, table: TableId) -> MemView {
         let view = self.memview_table("getFromExternrefTable", table);
         assert!(self.config.externref);
-        if !self.should_write_global(view.to_string()) {
-            return Ok(view);
-        }
         let table = self.export_name_of(table);
-        self.global(&format!(
-            "function {view}(idx) {{ return wasm.{table}.get(idx); }}",
-        ));
-
-        Ok(view)
+        intrinsic(&mut self.intrinsics, view.to_string().into(), || {
+            format!("\nfunction {view}(idx) {{ return wasm.{table}.get(idx); }}\n").into()
+        });
+        view
     }
 
-    fn expose_take_from_externref_table(
-        &mut self,
-        table: TableId,
-        drop: FunctionId,
-    ) -> Result<MemView, Error> {
+    fn expose_take_from_externref_table(&mut self, table: TableId, drop: FunctionId) -> MemView {
         let view = self.memview_table("takeFromExternrefTable", table);
         assert!(self.config.externref);
-        if !self.should_write_global(view.to_string()) {
-            return Ok(view);
-        }
         let drop = self.export_name_of(drop);
         let table = self.export_name_of(table);
-        self.global(&format!(
-            "
+        intrinsic(&mut self.intrinsics, view.to_string().into(), || {
+            format!(
+                "
                 function {view}(idx) {{
                     const value = wasm.{table}.get(idx);
                     wasm.{drop}(idx);
                     return value;
                 }}
             ",
-        ));
+            )
+            .into()
+        });
 
-        Ok(view)
+        view
     }
 
-    fn expose_add_to_externref_table(
-        &mut self,
-        table: TableId,
-        alloc: FunctionId,
-    ) -> Result<MemView, Error> {
+    fn expose_add_to_externref_table(&mut self, table: TableId, alloc: FunctionId) -> MemView {
         let view = self.memview_table("addToExternrefTable", table);
         assert!(self.config.externref);
-        if !self.should_write_global(view.to_string()) {
-            return Ok(view);
-        }
         let alloc = self.export_name_of(alloc);
         let table = self.export_name_of(table);
-        self.global(&format!(
-            "
-                function {view}(obj) {{
-                    const idx = wasm.{alloc}();
-                    wasm.{table}.set(idx, obj);
-                    return idx;
-                }}
-            ",
-        ));
-
-        Ok(view)
+        intrinsic(&mut self.intrinsics, view.to_string().into(), || {
+            format!(
+                "
+                    function {view}(obj) {{
+                        const idx = wasm.{alloc}();
+                        wasm.{table}.set(idx, obj);
+                        return idx;
+                    }}
+                ",
+            )
+            .into()
+        });
+        view
     }
 
     pub fn generate(&mut self) -> Result<(), Error> {
         self.prestore_global_import_identifiers()?;
-        // conditionally override Symbol.dispose
-        if self.config.symbol_dispose && !self.aux.structs.is_empty() {
-            self.expose_symbol_dispose()?;
-        }
-
-        for (id, adapter, kind) in iter_adapeter(self.aux, self.wit, self.module) {
+        for (id, adapter, kind) in iter_adapter(self.aux, self.wit, self.module) {
             let instrs = match &adapter.kind {
                 AdapterKind::Import { .. } => continue,
                 AdapterKind::Local { instructions } => instructions,
             };
             self.generate_adapter(id, adapter, instrs, kind)?;
+        }
+
+        // Ensure all imports for reexports are defined
+        for js_import in self.aux.reexports.values() {
+            self.import_name(js_import)?;
         }
 
         let mut pairs = self.aux.export_map.iter().collect::<Vec<_>>();
@@ -2693,13 +3178,24 @@ __wbg_set_wasm(wasm);"
             self.generate_struct(s)?;
         }
 
-        self.typescript.push_str(&self.aux.extra_typescript);
+        // Sort custom sections to avoid nondeterminism across CGUs.
+        let mut custom_sections: Vec<_> = self.aux.extra_typescript.iter().collect();
+        custom_sections.sort_unstable();
+        for section in custom_sections {
+            self.typescript.push_str(section);
+            self.typescript.push_str("\n\n");
+        }
 
         for path in self.aux.package_jsons.iter() {
             self.process_package_json(path)?;
         }
 
         self.export_destructor();
+
+        // Generate reset state function last, to ensure it knows about all other state.
+        if self.config.generate_reset_state {
+            self.generate_reset_state()?;
+        }
 
         Ok(())
     }
@@ -2786,6 +3282,9 @@ __wbg_set_wasm(wasm);"
                 ret_desc = &export.fn_ret_desc;
                 match &export.kind {
                     AuxExportKind::Function(_) => {}
+                    AuxExportKind::FunctionThis(_) => {
+                        builder.classless_this();
+                    }
                     AuxExportKind::Constructor(class) => builder.constructor(class),
                     AuxExportKind::Method { receiver, .. } => match receiver {
                         AuxReceiverKind::None => {}
@@ -2858,27 +3357,40 @@ __wbg_set_wasm(wasm);"
                 let ts_docs = format_doc_comments(&export.comments, ts_doc_opts);
 
                 match &export.kind {
-                    AuxExportKind::Function(name) => {
-                        if let Some(ts_sig) = ts_sig {
-                            self.typescript.push_str(&ts_docs);
-                            self.typescript.push_str("export function ");
-                            self.typescript.push_str(name);
-                            self.typescript.push_str(ts_sig);
-                            self.typescript.push_str(";\n");
-                        }
+                    AuxExportKind::Function(name) | AuxExportKind::FunctionThis(name) => {
+                        let identifier = self.generate_identifier(name);
 
-                        self.export(
+                        let mut typescript = String::new();
+                        let ts_comments = if let Some(ts_sig) = ts_sig {
+                            typescript.push_str("function ");
+                            typescript.push_str(&identifier);
+                            typescript.push_str(ts_sig);
+                            typescript.push_str(";\n");
+                            Some(ts_docs)
+                        } else {
+                            None
+                        };
+
+                        let definition = format!("function {identifier}{code}\n");
+                        define_export(
+                            &mut self.exports,
                             name,
-                            ExportJs::Function(&format!("function{code}")),
-                            Some(&js_docs),
+                            export.js_namespace.as_deref().unwrap_or_default(),
+                            ExportEntry::Definition(ExportDefinition {
+                                identifier,
+                                comments: Some(js_docs),
+                                definition,
+                                ts_definition: typescript,
+                                ts_comments,
+                                private: false,
+                            }),
                         )?;
-                        self.globals.push('\n');
                     }
                     AuxExportKind::Constructor(class) => {
-                        let exported = require_class(&mut self.exported_classes, class);
+                        let exported = self.require_class(class);
 
                         if exported.has_constructor {
-                            bail!("found duplicate constructor for class `{}`", class);
+                            bail!("found duplicate constructor for class `{class}`");
                         }
 
                         exported.has_constructor = true;
@@ -2890,7 +3402,7 @@ __wbg_set_wasm(wasm);"
                         receiver,
                         kind,
                     } => {
-                        let exported = require_class(&mut self.exported_classes, class);
+                        let exported = self.require_class(class);
 
                         let mut prefix = String::new();
                         if receiver.is_static() {
@@ -2945,9 +3457,9 @@ __wbg_set_wasm(wasm);"
             }
             ContextAdapterKind::Import(core) => {
                 let code = if catch {
-                    format!("function() {{ return handleError(function {code}, arguments) }}")
+                    format!("function() {{ return handleError(function {code}, arguments); }}")
                 } else if log_error {
-                    format!("function() {{ return logError(function {code}, arguments) }}")
+                    format!("function() {{ return logError(function {code}, arguments); }}")
                 } else {
                     format!("function{code}")
                 };
@@ -2959,7 +3471,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!log_error);
 
                 self.globals.push_str("function ");
-                self.globals.push_str(&self.adapter_name(id));
+                self.globals.push_str(&self.export_adapter_name(id));
                 self.globals.push_str(&code);
                 self.globals.push_str("\n\n");
             }
@@ -3004,9 +3516,7 @@ __wbg_set_wasm(wasm);"
                         call = Some(id);
                     }
                 }
-                Instruction::CallExport(_)
-                | Instruction::CallTableElement(_)
-                | Instruction::CallCore(_) => return Ok(false),
+                Instruction::CallExport(_) => return Ok(false),
                 _ => {}
             }
         }
@@ -3192,7 +3702,7 @@ __wbg_set_wasm(wasm);"
                     None => bail!("a function with no arguments cannot be variadic"),
                 };
                 if !args.is_empty() {
-                    format!("{}, ...{}", args.join(", "), last_arg)
+                    format!("{}, ...{last_arg}", args.join(", "))
                 } else {
                     format!("...{last_arg}")
                 }
@@ -3205,7 +3715,7 @@ __wbg_set_wasm(wasm);"
                         AuxValue::Bare(js) => self.import_name(js)?,
                         _ => bail!("invalid import set for constructor"),
                     };
-                    Ok(format!("new {}({})", js, variadic_args(args)?))
+                    Ok(format!("new {js}({})", variadic_args(args)?))
                 }
                 AdapterJsImportKind::Method => {
                     let descriptor = |anchor: &str, extra: &str, field: &str, which: &str| {
@@ -3236,22 +3746,21 @@ __wbg_set_wasm(wasm);"
                             descriptor(&class, "", field, "set")
                         }
                     };
-                    Ok(format!("{}.call({})", js, variadic_args(args)?))
+                    Ok(format!("{js}.call({})", variadic_args(args)?))
                 }
                 AdapterJsImportKind::Normal => {
                     let js = match val {
                         AuxValue::Bare(js) => self.import_name(js)?,
                         _ => bail!("invalid import set for free function"),
                     };
-                    Ok(format!("{}({})", js, variadic_args(args)?))
+                    Ok(format!("{js}({})", variadic_args(args)?))
                 }
             },
 
             AuxImport::ValueWithThis(class, name) => {
                 let class = self.import_name(class)?;
                 Ok(format!(
-                    "{}{}({})",
-                    class,
+                    "{class}{}({})",
                     property_accessor(name),
                     variadic_args(args)?
                 ))
@@ -3267,12 +3776,12 @@ __wbg_set_wasm(wasm);"
                     "\
                     let result;
                     try {{
-                        result = {} instanceof {};
+                        result = {} instanceof {js};
                     }} catch (_) {{
                         result = false;
                     }}
                     ",
-                    args[0], js,
+                    args[0],
                 )
                 .unwrap();
                 Ok("result".to_owned())
@@ -3298,38 +3807,13 @@ __wbg_set_wasm(wasm);"
                 Ok(format!("`{escaped}`"))
             }
 
-            AuxImport::Closure {
-                dtor,
-                mutable,
-                adapter,
-            } => {
+            AuxImport::Cast { sig_comment } => {
                 assert!(kind == AdapterJsImportKind::Normal);
                 assert!(!variadic);
-                assert_eq!(args.len(), 3);
+                assert_eq!(args.len(), 1);
 
-                let call = self.adapter_name(*adapter);
-
-                if *mutable {
-                    self.expose_make_mut_closure()?;
-
-                    Ok(format!(
-                        "makeMutClosure({arg0}, {arg1}, {dtor}, {call})",
-                        arg0 = &args[0],
-                        arg1 = &args[1],
-                        dtor = dtor,
-                        call = call,
-                    ))
-                } else {
-                    self.expose_make_closure()?;
-
-                    Ok(format!(
-                        "makeClosure({arg0}, {arg1}, {dtor}, {call})",
-                        arg0 = &args[0],
-                        arg1 = &args[1],
-                        dtor = dtor,
-                        call = call,
-                    ))
-                }
+                writeln!(prelude, "// Cast intrinsic for `{sig_comment}`.")?;
+                Ok(args[0].clone())
             }
 
             AuxImport::StructuralMethod(name) => {
@@ -3339,8 +3823,7 @@ __wbg_set_wasm(wasm);"
                     None => bail!("structural method calls must have at least one argument"),
                 };
                 Ok(format!(
-                    "{}{}({})",
-                    receiver,
+                    "{receiver}{}({})",
                     property_accessor(name),
                     variadic_args(args)?
                 ))
@@ -3349,7 +3832,12 @@ __wbg_set_wasm(wasm);"
             AuxImport::StructuralGetter(field) => {
                 assert!(kind == AdapterJsImportKind::Normal);
                 assert!(!variadic);
-                assert_eq!(args.len(), 1);
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "The getter '{field}' as more than one args ({n})",
+                    n = args.len()
+                );
                 Ok(format!("{}{}", args[0], property_accessor(field)))
             }
 
@@ -3358,7 +3846,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!variadic);
                 assert_eq!(args.len(), 0);
                 let class = self.import_name(class)?;
-                Ok(format!("{}{}", class, property_accessor(field)))
+                Ok(format!("{class}{}", property_accessor(field)))
             }
 
             AuxImport::StructuralSetter(field) => {
@@ -3378,12 +3866,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
                 let class = self.import_name(class)?;
-                Ok(format!(
-                    "{}{} = {}",
-                    class,
-                    property_accessor(field),
-                    args[0]
-                ))
+                Ok(format!("{class}{} = {}", property_accessor(field), args[0]))
             }
 
             AuxImport::IndexingGetterOfClass(class) => {
@@ -3391,7 +3874,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
                 let class = self.import_name(class)?;
-                Ok(format!("{}[{}]", class, args[0]))
+                Ok(format!("{class}[{}]", args[0]))
             }
 
             AuxImport::IndexingGetterOfObject => {
@@ -3406,7 +3889,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!variadic);
                 assert_eq!(args.len(), 2);
                 let class = self.import_name(class)?;
-                Ok(format!("{}[{}] = {}", class, args[0], args[1]))
+                Ok(format!("{class}[{}] = {}", args[0], args[1]))
             }
 
             AuxImport::IndexingSetterOfObject => {
@@ -3421,7 +3904,7 @@ __wbg_set_wasm(wasm);"
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
                 let class = self.import_name(class)?;
-                Ok(format!("delete {}[{}]", class, args[0]))
+                Ok(format!("delete {class}[{}]", args[0]))
             }
 
             AuxImport::IndexingDeleterOfObject => {
@@ -3435,8 +3918,8 @@ __wbg_set_wasm(wasm);"
                 assert!(kind == AdapterJsImportKind::Normal);
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
-                self.require_class_wrap(class);
-                Ok(format!("{}.__wrap({})", class, args[0]))
+                let identifier = self.require_class_wrap(class);
+                Ok(format!("{identifier}.__wrap({})", args[0]))
             }
 
             AuxImport::Intrinsic(intrinsic) => {
@@ -3453,6 +3936,7 @@ __wbg_set_wasm(wasm);"
                     let base = match self.config.mode {
                         OutputMode::Web
                         | OutputMode::Bundler { .. }
+                        | OutputMode::Module
                         | OutputMode::Deno
                         | OutputMode::Node { module: true } => "import.meta.url",
                         OutputMode::Node { module: false } => {
@@ -3485,8 +3969,8 @@ __wbg_set_wasm(wasm);"
                         URL.createObjectURL(new Blob([val], { type: \"text/javascript\" }))"
                         .to_owned())
                 } else {
-                    Err(anyhow!("wasm-bindgen needs to be invoked with `--split-linked-modules`, because \"{}\" cannot be embedded.\n\
-                        See https://rustwasm.github.io/wasm-bindgen/reference/cli.html#--split-linked-modules for details.", path))
+                    Err(anyhow!("wasm-bindgen needs to be invoked with `--split-linked-modules`, because \"{path}\" cannot be embedded.\n\
+                        See https://wasm-bindgen.github.io/wasm-bindgen/reference/cli.html#--split-linked-modules for details."))
                 }
             }
 
@@ -3494,8 +3978,8 @@ __wbg_set_wasm(wasm);"
                 assert!(kind == AdapterJsImportKind::Normal);
                 assert!(!variadic);
                 assert_eq!(args.len(), 1);
-                self.require_class_unwrap(class);
-                Ok(format!("{}.__unwrap({})", class, args[0]))
+                let identifier = self.require_class_unwrap(class);
+                Ok(format!("{identifier}.__unwrap({})", args[0]))
             }
         }
     }
@@ -3524,11 +4008,6 @@ __wbg_set_wasm(wasm);"
                 format!("typeof({}) === 'function'", args[0])
             }
 
-            Intrinsic::IsArray => {
-                assert_eq!(args.len(), 1);
-                format!("Array.isArray({})", args[0])
-            }
-
             Intrinsic::IsUndefined => {
                 assert_eq!(args.len(), 1);
                 format!("{} === undefined", args[0])
@@ -3537,6 +4016,16 @@ __wbg_set_wasm(wasm);"
             Intrinsic::IsNull => {
                 assert_eq!(args.len(), 1);
                 format!("{} === null", args[0])
+            }
+
+            Intrinsic::ObjectIsNullOrUndefined => {
+                assert_eq!(args.len(), 1);
+                format!("{} == null", args[0])
+            }
+
+            Intrinsic::ObjectIsUndefined => {
+                assert_eq!(args.len(), 1);
+                format!("{} === undefined", args[0])
             }
 
             Intrinsic::IsObject => {
@@ -3573,11 +4062,6 @@ __wbg_set_wasm(wasm);"
             Intrinsic::IsFalsy => {
                 assert_eq!(args.len(), 1);
                 format!("!{}", args[0])
-            }
-
-            Intrinsic::AsNumber => {
-                assert_eq!(args.len(), 1);
-                format!("+{}", args[0])
             }
 
             Intrinsic::TryIntoNumber => {
@@ -3712,51 +4196,6 @@ __wbg_set_wasm(wasm);"
                 args[0].clone()
             }
 
-            Intrinsic::CallbackDrop => {
-                assert_eq!(args.len(), 1);
-                prelude.push_str(&format!("const obj = {}.original;\n", args[0]));
-                prelude.push_str("if (obj.cnt-- == 1) {\n");
-                prelude.push_str("obj.a = 0;\n");
-                prelude.push_str("return true;\n");
-                prelude.push_str("}\n");
-                "false".to_string()
-            }
-
-            Intrinsic::NumberNew => {
-                assert_eq!(args.len(), 1);
-                args[0].clone()
-            }
-
-            Intrinsic::BigIntFromStr => {
-                assert_eq!(args.len(), 1);
-                format!("BigInt({})", args[0])
-            }
-
-            Intrinsic::BigIntFromI64 | Intrinsic::BigIntFromU64 => {
-                assert_eq!(args.len(), 1);
-                args[0].clone()
-            }
-
-            Intrinsic::BigIntFromI128 | Intrinsic::BigIntFromU128 => {
-                assert_eq!(args.len(), 2);
-                format!("{} << BigInt(64) | {}", args[0], args[1])
-            }
-
-            Intrinsic::StringNew => {
-                assert_eq!(args.len(), 1);
-                args[0].clone()
-            }
-
-            Intrinsic::SymbolNamedNew => {
-                assert_eq!(args.len(), 1);
-                format!("Symbol({})", args[0])
-            }
-
-            Intrinsic::SymbolAnonymousNew => {
-                assert_eq!(args.len(), 0);
-                "Symbol()".to_string()
-            }
-
             Intrinsic::NumberGet => {
                 assert_eq!(args.len(), 1);
                 prelude.push_str(&format!("const obj = {};\n", args[0]));
@@ -3772,7 +4211,7 @@ __wbg_set_wasm(wasm);"
             Intrinsic::BooleanGet => {
                 assert_eq!(args.len(), 1);
                 prelude.push_str(&format!("const v = {};\n", args[0]));
-                "typeof(v) === 'boolean' ? (v ? 1 : 0) : 2".to_string()
+                "typeof(v) === 'boolean' ? v : undefined".to_string()
             }
 
             Intrinsic::BigIntGetAsI64 => {
@@ -3791,22 +4230,15 @@ __wbg_set_wasm(wasm);"
                 format!("throw {}", args[0])
             }
 
-            Intrinsic::ErrorNew => {
-                assert_eq!(args.len(), 1);
-                format!("new Error({})", args[0])
-            }
-
             Intrinsic::Module => {
                 assert_eq!(args.len(), 0);
 
                 match self.config.mode {
-                    OutputMode::Web | OutputMode::NoModules { .. } => {
-                        "__wbg_init.__wbindgen_wasm_module"
-                    }
-                    OutputMode::Node { .. } => "wasmModule",
+                    OutputMode::Web | OutputMode::NoModules { .. } |
+                    OutputMode::Node { .. } | OutputMode::Module => "wasmModule",
                     _ => bail!(
                         "`wasm_bindgen::module` is currently only supported with \
-                         `--target no-modules`, `--target web` and `--target nodejs`"
+                         `--target no-modules`, `--target web`, `--target module` and `--target nodejs`"
                     ),
                 }
                 .to_string()
@@ -3846,20 +4278,6 @@ __wbg_set_wasm(wasm);"
                 format!("debugString({})", args[0])
             }
 
-            Intrinsic::JsonParse => {
-                assert_eq!(args.len(), 1);
-                format!("JSON.parse({})", args[0])
-            }
-
-            Intrinsic::JsonSerialize => {
-                assert_eq!(args.len(), 1);
-                // Turns out `JSON.stringify(undefined) === undefined`, so if
-                // we're passed `undefined` reinterpret it as `null` for JSON
-                // purposes.
-                prelude.push_str(&format!("const obj = {};\n", args[0]));
-                "JSON.stringify(obj === undefined ? null : obj)".to_string()
-            }
-
             Intrinsic::CopyToTypedArray => {
                 assert_eq!(args.len(), 2);
                 format!(
@@ -3867,31 +4285,6 @@ __wbg_set_wasm(wasm);"
                     src = args[0],
                     dst = args[1]
                 )
-            }
-
-            Intrinsic::Uint8ArrayNew
-            | Intrinsic::Uint8ClampedArrayNew
-            | Intrinsic::Uint16ArrayNew
-            | Intrinsic::Uint32ArrayNew
-            | Intrinsic::BigUint64ArrayNew
-            | Intrinsic::Int8ArrayNew
-            | Intrinsic::Int16ArrayNew
-            | Intrinsic::Int32ArrayNew
-            | Intrinsic::BigInt64ArrayNew
-            | Intrinsic::Float32ArrayNew
-            | Intrinsic::Float64ArrayNew => {
-                assert_eq!(args.len(), 1);
-                args[0].clone()
-            }
-
-            Intrinsic::ArrayNew => {
-                assert_eq!(args.len(), 0);
-                "[]".to_string()
-            }
-
-            Intrinsic::ArrayPush => {
-                assert_eq!(args.len(), 2);
-                format!("{}.push({})", args[0], args[1])
             }
 
             Intrinsic::ExternrefHeapLiveCount => {
@@ -3908,8 +4301,7 @@ __wbg_set_wasm(wasm);"
                     ",
                 );
                 format!(
-                    "heap.length - free_count - {} - {}",
-                    INITIAL_HEAP_OFFSET,
+                    "heap.length - free_count - {INITIAL_HEAP_OFFSET} - {}",
                     INITIAL_HEAP_VALUES.len(),
                 )
             }
@@ -3926,31 +4318,39 @@ __wbg_set_wasm(wasm);"
                 // returns `undefined` for types like `None` going out.
                 let mut base = format!(
                     "
-                      const table = wasm.{};
+                      const table = wasm.{name};
                       const offset = table.grow({});
                       table.set(0, undefined);
                     ",
-                    name,
                     INITIAL_HEAP_VALUES.len(),
                 );
                 for (i, value) in INITIAL_HEAP_VALUES.iter().enumerate() {
-                    base.push_str(&format!("table.set(offset + {i}, {value});\n"));
+                    base.push_str(&format!(
+                        "{}table.set(offset + {i}, {value})",
+                        if i > 0 { ";\n" } else { "" }
+                    ));
                 }
                 base
+            }
+            Intrinsic::PanicError => {
+                assert_eq!(args.len(), 1);
+                self.expose_panic_error();
+                format!("new PanicError({})", args[0])
             }
         };
         Ok(expr)
     }
 
     fn generate_enum(&mut self, enum_: &AuxEnum) -> Result<(), Error> {
-        let mut variants = String::new();
+        let identifier = self.generate_identifier(&enum_.name);
 
+        let ts_comments = format_doc_comments(&enum_.comments, None);
+        let mut typescript = String::new();
         if enum_.generate_typescript {
-            self.typescript
-                .push_str(&format_doc_comments(&enum_.comments, None));
-            self.typescript
-                .push_str(&format!("export enum {} {{", enum_.name));
+            typescript.push_str(&format!("enum {identifier} {{"));
         }
+
+        let mut variants = String::new();
         for (name, value, comments) in enum_.variants.iter() {
             let variant_docs = if comments.is_empty() {
                 String::new()
@@ -3961,19 +4361,19 @@ __wbg_set_wasm(wasm);"
             variants.push_str(&format!("{name}: {value}, "));
             variants.push_str(&format!("\"{value}\": \"{name}\",\n"));
             if enum_.generate_typescript {
-                self.typescript.push('\n');
+                typescript.push('\n');
                 if !variant_docs.is_empty() {
                     for line in variant_docs.lines() {
-                        self.typescript.push_str("  ");
-                        self.typescript.push_str(line);
-                        self.typescript.push('\n');
+                        typescript.push_str("  ");
+                        typescript.push_str(line);
+                        typescript.push('\n');
                     }
                 }
-                self.typescript.push_str(&format!("  {name} = {value},"));
+                typescript.push_str(&format!("  {name} = {value},"));
             }
         }
         if enum_.generate_typescript {
-            self.typescript.push_str("\n}\n");
+            typescript.push_str("\n}\n");
         }
 
         // add an `@enum {1 | 2 | 3}` to ensure that enums type-check even without .d.ts
@@ -3987,10 +4387,20 @@ __wbg_set_wasm(wasm);"
         at_enum.push('}');
         let docs = format_doc_comments(&enum_.comments, Some(at_enum));
 
-        self.export(
+        let definition = format!("const {identifier} = Object.freeze({{\n{variants}}});\n");
+
+        define_export(
+            &mut self.exports,
             &enum_.name,
-            ExportJs::Expression(&format!("Object.freeze({{\n{variants}}})")),
-            Some(&docs),
+            enum_.js_namespace.as_deref().unwrap_or_default(),
+            ExportEntry::Definition(ExportDefinition {
+                identifier,
+                comments: Some(docs),
+                definition,
+                ts_definition: typescript,
+                ts_comments: Some(ts_comments),
+                private: enum_.private,
+            }),
         )?;
 
         Ok(())
@@ -4016,7 +4426,7 @@ __wbg_set_wasm(wasm);"
             };
 
             self.typescript.push_str(&docs);
-            self.typescript.push_str("type ");
+            self.typescript.push_str("\ntype ");
             self.typescript.push_str(&string_enum.name);
             self.typescript.push_str(" = ");
             self.typescript.push_str(&type_expr);
@@ -4026,7 +4436,7 @@ __wbg_set_wasm(wasm);"
         if self.used_string_enums.contains(&string_enum.name) {
             // only generate the internal string enum array if it's actually used
             self.global(&format!(
-                "const __wbindgen_enum_{name} = [{values}];\n",
+                "\nconst __wbindgen_enum_{name} = [{values}];\n",
                 name = string_enum.name,
                 values = variants.join(", ")
             ));
@@ -4040,10 +4450,12 @@ __wbg_set_wasm(wasm);"
     }
 
     fn generate_struct(&mut self, struct_: &AuxStruct) -> Result<(), Error> {
-        let class = require_class(&mut self.exported_classes, &struct_.name);
+        let class = self.require_class(&struct_.name);
         class.comments = format_doc_comments(&struct_.comments, None);
         class.is_inspectable = struct_.is_inspectable;
         class.generate_typescript = struct_.generate_typescript;
+        class.private = struct_.private;
+        class.js_namespace = struct_.js_namespace.as_ref().map(|ns| ns.to_vec());
         Ok(())
     }
 
@@ -4097,9 +4509,8 @@ __wbg_set_wasm(wasm);"
             };
             if let Some((prev, _prev_version)) = self.npm_dependencies.get(name) {
                 bail!(
-                    "dependency on NPM package `{}` specified in two `package.json` files, \
+                    "dependency on NPM package `{name}` specified in two `package.json` files, \
                      which at the time is not allowed:\n  * {}\n  * {}",
-                    name,
                     path.display(),
                     prev.display(),
                 )
@@ -4113,13 +4524,9 @@ __wbg_set_wasm(wasm);"
     }
 
     fn expose_debug_string(&mut self) {
-        if !self.should_write_global("debug_string") {
-            return;
-        }
-
-        self.global(
+        intrinsic(&mut self.intrinsics, "debug_string".into(), || {
             "
-           function debugString(val) {
+            function debugString(val) {
                 // primitive types
                 const type = typeof val;
                 if (type == 'number' || type == 'boolean' || val == null) {
@@ -4183,8 +4590,9 @@ __wbg_set_wasm(wasm);"
                 // TODO we could test for more things here, like `Set`s and `Map`s.
                 return className;
             }
-        ",
-        );
+            "
+            .into()
+        });
     }
 
     fn export_function_table(&mut self) -> Result<String, Error> {
@@ -4195,73 +4603,52 @@ __wbg_set_wasm(wasm);"
     }
 
     fn export_name_of(&mut self, id: impl Into<walrus::ExportItem>) -> String {
-        let id = id.into();
-        let export = self.module.exports.iter().find(|e| {
-            use walrus::ExportItem::*;
+        use walrus::ExportItem::*;
 
-            match (e.item, id) {
-                (Function(a), Function(b)) => a == b,
-                (Table(a), Table(b)) => a == b,
-                (Memory(a), Memory(b)) => a == b,
-                (Global(a), Global(b)) => a == b,
-                _ => false,
-            }
+        let id = id.into();
+        let export = self.module.exports.iter().find(|e| match (e.item, id) {
+            (Function(a), Function(b)) => a == b,
+            (Table(a), Table(b)) => a == b,
+            (Memory(a), Memory(b)) => a == b,
+            (Global(a), Global(b)) => a == b,
+            (Tag(a), Tag(b)) => a == b,
+            _ => false,
         });
         if let Some(export) = export {
             return export.name.clone();
         }
-        let default_name = format!("__wbindgen_export_{}", self.next_export_idx);
-        self.next_export_idx += 1;
         let name = match id {
-            walrus::ExportItem::Memory(_) if self.module.memories.iter().count() == 1 => {
-                "memory".to_owned()
-            }
-            walrus::ExportItem::Function(f) => match &self.module.funcs.get(f).name {
-                Some(s) => {
-                    let mut name = to_js_identifier(s);
-
-                    // Account for duplicate export names.
-                    // See https://github.com/rustwasm/wasm-bindgen/issues/4371.
-                    if self.module.exports.get_func(&name).is_ok() {
-                        name.push_str(&self.next_export_idx.to_string());
-                    }
-
-                    name
-                }
-                _ => default_name,
-            },
-            _ => default_name,
-        };
-        self.module.exports.add(&name, id);
-        return name;
-
-        // Not really an exhaustive list, but works for our purposes.
-        fn to_js_identifier(name: &str) -> String {
-            name.chars()
-                .map(|c| {
-                    if c.is_ascii() && (c.is_alphabetic() || c.is_numeric()) {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect()
+            Function(f) => self.module.funcs.get(f).name.as_deref(),
+            Table(table) => self.module.tables.get(table).name.as_deref(),
+            Memory(_) => Some("memory"),
+            Global(g) => self.module.globals.get(g).name.as_deref(),
+            Tag(t) => self.module.tags.get(t).name.as_deref(),
         }
+        .unwrap_or("__wbindgen_export");
+        let name = self.generate_identifier(&to_valid_ident(name));
+        self.module.exports.add(&name, id);
+        name
     }
 
-    fn adapter_name(&self, id: AdapterId) -> String {
-        format!("__wbg_adapter_{}", id.0)
+    fn export_adapter_name(&self, adapter_id: AdapterId) -> String {
+        let (export_id, _) = *self
+            .wit
+            .exports
+            .iter()
+            .find(|(_, id)| *id == adapter_id)
+            .expect("could not find an export adapter");
+
+        self.module.exports.get(export_id).name.clone()
     }
 
     fn generate_identifier(&mut self, name: &str) -> String {
+        let name = to_valid_ident(name);
         let cnt = self
             .defined_identifiers
             .entry(name.to_string())
             .or_insert(0);
         *cnt += 1;
-        // We want to mangle `default` at once, so we can support default exports and don't generate
-        // invalid glue code like this: `import { default } from './module';`.
-        if *cnt == 1 && name != "default" {
+        if *cnt == 1 {
             name.to_string()
         } else {
             format!("{name}{cnt}")
@@ -4337,7 +4724,7 @@ impl<'a> ContextAdapterKind<'a> {
 }
 
 /// Iterate over the adapters in a deterministic order.
-fn iter_adapeter<'a>(
+fn iter_adapter<'a>(
     aux: &'a WasmBindgenAux,
     wit: &'a NonstandardWitSection,
     module: &Module,
@@ -4352,15 +4739,9 @@ fn iter_adapeter<'a>(
         })
         .collect();
 
-    // Since `wit.adapters` is a BTreeMap, the adapters are already sorted by
-    // their ID. This is good enough for exports and adapters, but imports need
-    // to be sorted by their name.
-    //
-    // Note: we do *NOT* want to sort exports by name. By default, exports are
-    // the order in which they were defined in the Rust code. Sorting them by
-    // name would break that order and take away control from the user.
-
-    adapters.sort_by(|(_, _, a), (_, _, b)| {
+    // Sort adapters by kind first (imports, exports, adapters), then by name within each kind
+    // to ensure deterministic ordering of generated code.
+    adapters.sort_by(|(a_id, _, a), (b_id, _, b)| {
         fn get_kind_order(kind: &ContextAdapterKind) -> u8 {
             match kind {
                 ContextAdapterKind::Import(_) => 0,
@@ -4374,6 +4755,39 @@ fn iter_adapeter<'a>(
                 let a = module.imports.get(*a);
                 let b = module.imports.get(*b);
                 a.name.cmp(&b.name)
+            }
+            (ContextAdapterKind::Export(a), ContextAdapterKind::Export(b)) => {
+                // Sort exports by debug_name to ensure deterministic identifier generation
+                // when multiple exports have the same JS name (e.g., due to js_name attribute).
+                a.debug_name.cmp(&b.debug_name)
+            }
+            (ContextAdapterKind::Adapter, ContextAdapterKind::Adapter) => {
+                let export_a = wit.exports.iter().find(|(_, id)| id == a_id);
+                let export_b = wit.exports.iter().find(|(_, id)| id == b_id);
+
+                match (export_a, export_b) {
+                    (Some((export_id_a, _)), Some((export_id_b, _))) => {
+                        let export_a = module.exports.get(*export_id_a);
+                        let export_b = module.exports.get(*export_id_b);
+                        // We cannot sort mangled names as they are machine-dependent, therefore we instead
+                        // sort by function signature.
+                        let get_type_key = |export: &walrus::Export| -> String {
+                            let func_id = match export.item {
+                                walrus::ExportItem::Function(id) => id,
+                                _ => return String::new(),
+                            };
+                            let ty_id = module.funcs.get(func_id).ty();
+                            let ty = module.types.get(ty_id);
+                            // Create a string representation of the type signature
+                            format!("{:?}-{:?}", ty.params(), ty.results())
+                        };
+
+                        get_type_key(export_b).cmp(&get_type_key(export_a))
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less, // Exported adapters come first
+                    (None, Some(_)) => std::cmp::Ordering::Greater, // Exported adapters come first
+                    (None, None) => a_id.cmp(b_id), // Both without exports, compare by ID
+                }
             }
             _ => get_kind_order(a).cmp(&get_kind_order(b)),
         }
@@ -4422,8 +4836,7 @@ fn check_duplicated_getter_and_setter_names(
             && first_receiver.is_static() == second_receiver.is_static();
         if both_are_in_the_same_class && both_are_referencing_the_same_field {
             bail!(format!(
-                "There can be only one getter/setter definition for `{}` in `{}`",
-                first_field, first_class
+                "There can be only one getter/setter definition for `{first_field}` in `{first_class}`"
             ));
         }
         Ok(())
@@ -4506,15 +4919,59 @@ fn format_doc_comments(comments: &str, js_doc_comments: Option<String>) -> Strin
     }
 }
 
-fn require_class<'a>(
-    exported_classes: &'a mut Option<BTreeMap<String, ExportedClass>>,
-    name: &str,
-) -> &'a mut ExportedClass {
-    exported_classes
-        .as_mut()
-        .expect("classes already written")
-        .entry(name.to_string())
-        .or_default()
+/// Defines an export with an optional namespace path segment
+/// Namespaces are defined into the exports map as needed via ExportEntry::Namespace
+fn define_export(
+    exports: &mut BTreeMap<String, ExportEntry>,
+    export_name: &str,
+    ns_path: &[String],
+    export: ExportEntry,
+) -> Result<(), Error> {
+    // Namespaces are only defined into exports by this function, not by consumers of this function.
+    assert!(!matches!(export, ExportEntry::Namespace(_)));
+
+    if ns_path.is_empty() {
+        match exports.entry(export_name.to_string()) {
+            Entry::Vacant(e) => {
+                e.insert(export);
+            }
+            Entry::Occupied(mut e) => {
+                if let ExportEntry::Definition(def) = export {
+                    if def.definition.is_empty() {
+                        if let ExportEntry::Namespace(ns) = e.get_mut() {
+                            if ns.id.is_none() {
+                                ns.id = Some(def.identifier);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                bail!("Cannot define export over existing namespace {export_name}");
+            }
+        };
+    } else {
+        let export_entry = exports
+            .entry(ns_path[0].to_string())
+            .or_insert(ExportEntry::Namespace(Default::default()));
+        let ns = match export_entry {
+            ExportEntry::Namespace(ns) => ns,
+            ExportEntry::Definition(def) if def.definition.is_empty() => {
+                *export_entry = ExportEntry::Namespace(ExportedNamespace {
+                    id: Some(def.identifier.to_string()),
+                    ns: BTreeMap::new(),
+                });
+                let ExportEntry::Namespace(ns) = export_entry else {
+                    unreachable!();
+                };
+                ns
+            }
+            _ => {
+                bail!("Cannot to define namespace export over existing definition {export_name}");
+            }
+        };
+        define_export(&mut ns.ns, export_name, &ns_path[1..], export)?;
+    }
+    Ok(())
 }
 
 /// Returns a string to tack on to the end of an expression to access a
@@ -4586,6 +5043,19 @@ impl ExportedClass {
             field.getter = Some(accessor);
         }
     }
+}
+
+type Intrinsics = BTreeMap<Cow<'static, str>, Cow<'static, str>>;
+
+fn intrinsic(
+    intrinsics: &mut Option<Intrinsics>,
+    name: Cow<'static, str>,
+    f: impl FnOnce() -> Cow<'static, str>,
+) {
+    if intrinsics.as_ref().unwrap().contains_key(&name) {
+        return;
+    }
+    intrinsics.as_mut().unwrap().insert(name, f());
 }
 
 struct MemView {

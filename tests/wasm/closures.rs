@@ -142,7 +142,7 @@ fn cannot_reuse() {
 
 #[wasm_bindgen_test]
 fn debug() {
-    let closure = Closure::wrap(Box::new(|| {}) as Box<dyn FnMut()>);
+    let closure: Closure<dyn FnMut()> = Closure::wrap(Box::new(|| {}));
     assert_eq!(&format!("{:?}", closure), "Closure { ... }");
 }
 
@@ -150,7 +150,7 @@ fn debug() {
 fn long_lived() {
     let hit = Rc::new(Cell::new(false));
     let hit2 = hit.clone();
-    let a = Closure::new(move || hit2.set(true));
+    let a = Closure::new_aborting(move || hit2.set(true));
     assert!(!hit.get());
     long_lived_call1(&a);
     assert!(hit.get());
@@ -158,7 +158,7 @@ fn long_lived() {
     let hit = Rc::new(Cell::new(false));
     {
         let hit = hit.clone();
-        let a = Closure::new(move |x| {
+        let a = Closure::new_aborting(move |x| {
             hit.set(true);
             x + 3
         });
@@ -170,8 +170,8 @@ fn long_lived() {
 #[wasm_bindgen_test]
 fn many_arity() {
     many_arity_call1(&Closure::new(|| {}));
-    many_arity_call2(&Closure::new(|a| assert_eq!(a, 1)));
-    many_arity_call3(&Closure::new(|a, b| assert_eq!((a, b), (1, 2))));
+    many_arity_call2(&ScopedClosure::new(|a| assert_eq!(a, 1)));
+    many_arity_call3(&StaticClosure::new(|a, b| assert_eq!((a, b), (1, 2))));
     many_arity_call4(&Closure::new(|a, b, c| assert_eq!((a, b, c), (1, 2, 3))));
     many_arity_call5(&Closure::new(|a, b, c, d| {
         assert_eq!((a, b, c, d), (1, 2, 3, 4))
@@ -251,7 +251,7 @@ fn many_arity() {
 fn option() {
     let hit = Rc::new(Cell::new(false));
     let hit2 = hit.clone();
-    let a = Closure::new(move || hit2.set(true));
+    let a = Closure::new_aborting(move || hit2.set(true));
     assert!(!hit.get());
     option_call1(Some(&a));
     assert!(hit.get());
@@ -259,7 +259,7 @@ fn option() {
     let hit = Rc::new(Cell::new(false));
     {
         let hit = hit.clone();
-        let a = Closure::new(move |x| {
+        let a = Closure::new_aborting(move |x| {
             hit.set(true);
             x + 3
         });
@@ -284,7 +284,7 @@ fn call_fn_once_twice() {
     let dropper = Dropper(dropped.clone());
     let called = Rc::new(Cell::new(false));
 
-    let c = Closure::once({
+    let c = Closure::once_aborting({
         let called = called.clone();
         move || {
             assert!(!called.get());
@@ -302,18 +302,20 @@ fn call_fn_once_twice() {
 
 #[wasm_bindgen_test]
 fn once_into_js() {
+    use std::panic::AssertUnwindSafe;
+
     let dropped = Rc::new(Cell::new(false));
     let dropper = Dropper(dropped.clone());
     let called = Rc::new(Cell::new(false));
 
-    let f = Closure::once_into_js({
+    let f = Closure::once_into_js(AssertUnwindSafe({
         let called = called.clone();
         move || {
             assert!(!called.get());
             called.set(true);
             drop(dropper);
         }
-    });
+    }));
 
     call_val(&f);
     assert!(called.get());
@@ -326,7 +328,7 @@ fn once_into_js() {
 fn long_lived_dropping() {
     let hit = Rc::new(Cell::new(false));
     let hit2 = hit.clone();
-    let a = Closure::new(move || hit2.set(true));
+    let a = Closure::new_aborting(move || hit2.set(true));
     long_lived_dropping_cache(&a);
     assert!(!hit.get());
     assert!(long_lived_dropping_call().is_ok());
@@ -340,7 +342,7 @@ fn long_lived_option_dropping() {
     let hit = Rc::new(Cell::new(false));
     let hit2 = hit.clone();
 
-    let a = Closure::new(move || hit2.set(true));
+    let a = Closure::new_aborting(move || hit2.set(true));
 
     assert!(!long_lived_option_dropping_cache(None));
     assert!(long_lived_option_dropping_cache(Some(&a)));
@@ -457,7 +459,7 @@ fn drop_during_call_ok() {
     let rc2 = rc.clone();
     let x = 3;
     let a = A;
-    let x: Closure<dyn Fn()> = Closure::new(move || {
+    let x: Closure<dyn Fn()> = Closure::new_aborting(move || {
         // "drop ourselves"
         drop(rc2.borrow_mut().take().unwrap());
 
@@ -510,7 +512,7 @@ fn test_closure_returner() {
     pub fn closure_returner() -> Result<Object, JsValue> {
         let o = Object::new();
 
-        let some_fn = Closure::wrap(Box::new(move || BadStruct {}) as Box<ClosureType>);
+        let some_fn = Closure::<ClosureType>::wrap(Box::new(move || BadStruct {}));
         Reflect::set(
             &o,
             &JsValue::from("someKey"),
@@ -547,12 +549,12 @@ fn reference_as_first_argument_builds_at_all() {
         fn ref_first_custom4(a: &Closure<dyn FnMut(&RefFirstArgument)>);
     }
 
-    Closure::wrap(Box::new(|_: &JsValue| ()) as Box<dyn Fn(&JsValue)>);
-    Closure::wrap(Box::new(|_: &JsValue| ()) as Box<dyn FnMut(&JsValue)>);
+    Closure::<dyn Fn(&JsValue)>::wrap(Box::new(|_: &JsValue| ()));
+    Closure::<dyn FnMut(&JsValue)>::wrap(Box::new(|_: &JsValue| ()));
     Closure::once(|_: &JsValue| ());
     Closure::once_into_js(|_: &JsValue| ());
-    Closure::wrap(Box::new(|_: &RefFirstArgument| ()) as Box<dyn Fn(&RefFirstArgument)>);
-    Closure::wrap(Box::new(|_: &RefFirstArgument| ()) as Box<dyn FnMut(&RefFirstArgument)>);
+    Closure::<dyn Fn(&RefFirstArgument)>::wrap(Box::new(|_: &RefFirstArgument| ()));
+    Closure::<dyn FnMut(&RefFirstArgument)>::wrap(Box::new(|_: &RefFirstArgument| ()));
     Closure::once(|_: &RefFirstArgument| ());
     Closure::once_into_js(|_: &RefFirstArgument| ());
 }
@@ -562,7 +564,7 @@ fn reference_as_first_argument_works() {
     let a = Rc::new(Cell::new(0));
     let b = {
         let a = a.clone();
-        Closure::once(move |x: &RefFirstArgument| {
+        Closure::once_aborting(move |x: &RefFirstArgument| {
             assert_eq!(a.get(), 0);
             assert_eq!(x.contents, 3);
             a.set(a.get() + 1);
@@ -570,7 +572,7 @@ fn reference_as_first_argument_works() {
     };
     let c = {
         let a = a.clone();
-        Closure::once(move |x: &RefFirstArgument| {
+        Closure::once_aborting(move |x: &RefFirstArgument| {
             assert_eq!(a.get(), 1);
             assert_eq!(x.contents, 3);
             a.set(a.get() + 1);
@@ -609,33 +611,33 @@ fn call_destroyed_doesnt_segfault() {
     }
 
     let a = A(1, 1);
-    let a = Closure::wrap(Box::new(move || {
+    let a = Closure::<dyn Fn()>::wrap(Box::new(move || {
         let _ = a;
-    }) as Box<dyn Fn()>);
+    }));
     let b = a.as_ref().clone();
     drop(a);
     call_destroyed(&b);
 
     let a = A(2, 2);
-    let a = Closure::wrap(Box::new(move || {
+    let a = Closure::<dyn FnMut()>::wrap(Box::new(move || {
         let _ = a;
-    }) as Box<dyn FnMut()>);
+    }));
     let b = a.as_ref().clone();
     drop(a);
     call_destroyed(&b);
 
     let a = A(1, 1);
-    let a = Closure::wrap(Box::new(move |_: &JsValue| {
+    let a = Closure::<dyn Fn(&JsValue)>::wrap(Box::new(move |_: &JsValue| {
         let _ = a;
-    }) as Box<dyn Fn(&JsValue)>);
+    }));
     let b = a.as_ref().clone();
     drop(a);
     call_destroyed(&b);
 
     let a = A(2, 2);
-    let a = Closure::wrap(Box::new(move |_: &JsValue| {
+    let a = Closure::<dyn FnMut(&JsValue)>::wrap(Box::new(move |_: &JsValue| {
         let _ = a;
-    }) as Box<dyn FnMut(&JsValue)>);
+    }));
     let b = a.as_ref().clone();
     drop(a);
     call_destroyed(&b);
@@ -643,7 +645,7 @@ fn call_destroyed_doesnt_segfault() {
 
 #[wasm_bindgen_test]
 fn forget_works() {
-    let a = Closure::wrap(Box::new(|| {}) as Box<dyn Fn()>);
+    let a = Closure::<dyn Fn()>::wrap(Box::new(|| {}));
     js_store_forgotten_closure(&a);
     a.forget();
     js_call_forgotten_closure();
@@ -653,4 +655,407 @@ fn forget_works() {
 fn named_externref_no_duplicate_adapter() {
     externref_call(&Closure::new(|a| assert_eq!(a, 1)));
     named_externref_call(&Closure::new(|a| assert_eq!(a, 1)));
+}
+
+#[wasm_bindgen_test]
+fn closure_does_not_leak() {
+    let initial = wasm_bindgen::externref_heap_live_count();
+    let dropped = Rc::new(Cell::new(false));
+    let mut dropper = Dropper(dropped.clone());
+    drop(Closure::new_aborting(move || {
+        // just ensure that `dropper` is moved into the closure environment
+        // (we can't use it by value because it's not a FnOnce closure)
+        let _ = &mut dropper;
+    }));
+    assert_eq!(
+        wasm_bindgen::externref_heap_live_count(),
+        initial,
+        "JS closure not dropped"
+    );
+    assert!(dropped.get(), "Rust closure not dropped");
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen(module = "tests/wasm/closures.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = many_arity_call1)]
+    fn abort_closure_call1(a: &Closure<dyn Fn()>);
+    #[wasm_bindgen(js_name = many_arity_call2)]
+    fn abort_closure_call2(a: &Closure<dyn Fn(u32)>);
+    #[wasm_bindgen(js_name = long_lived_call2)]
+    fn abort_closure_call_mut(a: &Closure<dyn FnMut(u32) -> u32>) -> u32;
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_basic() {
+    let hit = Rc::new(Cell::new(false));
+    let hit2 = hit.clone();
+    let a = Closure::new_aborting(move || hit2.set(true));
+    assert!(!hit.get());
+    abort_closure_call1(&a);
+    assert!(hit.get());
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_with_non_unwind_safe() {
+    use std::cell::RefCell;
+
+    // RefCell is not UnwindSafe, but Closure::new_aborting doesn't require it
+    let rc = Rc::new(RefCell::new(0));
+    let rc2 = rc.clone();
+    let a = Closure::new_aborting(move || {
+        *rc2.borrow_mut() += 1;
+    });
+    abort_closure_call1(&a);
+    assert_eq!(*rc.borrow(), 1);
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_debug() {
+    let closure = Closure::<dyn FnMut()>::wrap(Box::new(|| {}));
+    assert_eq!(&format!("{:?}", closure), "Closure { ... }");
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_once() {
+    let s = String::from("test");
+    let closure = Closure::once(move || {
+        drop(s);
+    });
+    many_arity_call_mut1(&closure);
+    // Calling again should throw, but we can't easily test that from Rust
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_fnmut() {
+    let hit = Rc::new(Cell::new(0));
+    let hit2 = hit.clone();
+    let a = Closure::new_aborting(move |x| {
+        hit2.set(hit2.get() + 1);
+        x + 3
+    });
+    assert_eq!(abort_closure_call_mut(&a), 5);
+    assert_eq!(hit.get(), 1);
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn abort_closure_forget() {
+    let a = Closure::<dyn Fn()>::wrap(Box::new(|| {}));
+    js_store_forgotten_closure(&a);
+    a.forget();
+    js_call_forgotten_closure();
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn closure_unwind_safe_catches_panic() {
+    // Closure::new should catch panics when invoked from JS
+    let a = Closure::new(|| {
+        panic!("test panic");
+    });
+    // JS should catch this as a PanicError
+    assert!(calling_it_throws(&a));
+}
+
+#[cfg(all(feature = "std", target_arch = "wasm32", panic = "unwind"))]
+#[wasm_bindgen_test]
+fn closure_with_assert_unwind_safe() {
+    use std::panic::AssertUnwindSafe;
+
+    // Rc<Cell> is not UnwindSafe, but we can wrap with AssertUnwindSafe
+    let rc = Rc::new(Cell::new(0));
+    let rc2 = AssertUnwindSafe(rc.clone());
+    let a = Closure::new(move || {
+        rc2.set(rc2.get() + 1);
+    });
+    many_arity_call1(&a);
+    assert_eq!(rc.get(), 1);
+}
+
+#[wasm_bindgen(module = "tests/wasm/closures.js")]
+extern "C" {
+    fn closure_with_call(f: &ScopedClosure<dyn FnMut()>);
+    fn closure_with_cache(f: &ScopedClosure<dyn FnMut()>);
+    #[wasm_bindgen(catch)]
+    fn closure_with_call_cached() -> Result<(), JsValue>;
+    fn closure_with_call_and_cache(f: &ScopedClosure<dyn FnMut(u32)>);
+    fn closure_with_call_cached_throws() -> bool;
+}
+
+/// Test that ScopedClosure::borrow_mut works correctly during the callback body
+#[wasm_bindgen_test]
+fn closure_with_works_during_body() {
+    let called = Cell::new(false);
+    {
+        let mut func = || {
+            called.set(true);
+        };
+        let closure = ScopedClosure::borrow_mut(&mut func);
+        closure_with_call(&closure);
+    }
+    assert!(called.get());
+}
+
+/// Test that ScopedClosure::borrow_mut allows capturing non-'static references
+#[wasm_bindgen_test]
+fn closure_with_captures_non_static() {
+    let mut value = 0u32;
+    {
+        let mut func = || {
+            value += 1;
+        };
+        let closure = ScopedClosure::borrow_mut(&mut func);
+        closure_with_call(&closure);
+        closure_with_call(&closure);
+        closure_with_call(&closure);
+    }
+    assert_eq!(value, 3);
+}
+
+/// Test that using a ScopedClosure closure after the borrow ends throws an error
+#[wasm_bindgen_test]
+fn closure_with_use_after_free_throws() {
+    // Cache the closure's JS function during the borrowed scope
+    {
+        let mut func = || {
+            // This closure body doesn't matter - we just want to cache the JS function
+        };
+        let closure = ScopedClosure::borrow_mut(&mut func);
+        closure_with_cache(&closure);
+    }
+
+    // After the borrow ends, the closure has been invalidated.
+    // Calling it should throw an error.
+    let result = closure_with_call_cached();
+    let _ = result.expect_err("calling closure after ScopedClosure should throw");
+}
+
+/// Test that a ScopedClosure closure throws when JS retains and calls it after invalidation
+#[wasm_bindgen_test]
+fn closure_with_cached_throws_after_drop() {
+    let mut sum = 0u32;
+    {
+        let mut func = |value: u32| {
+            sum += value;
+        };
+        let closure = ScopedClosure::borrow_mut(&mut func);
+        // JS will cache the closure AND call it 3 times during this callback
+        closure_with_call_and_cache(&closure);
+    }
+    // Closure worked during the callback
+    assert_eq!(sum, 6); // 1 + 2 + 3
+
+    // Now the closure has been invalidated. JS tries to call the cached reference
+    // and should get an exception.
+    assert!(
+        closure_with_call_cached_throws(),
+        "calling cached ScopedClosure closure after drop should throw"
+    );
+}
+
+/// Test that ScopedClosure can be used where &Closure is expected (same type)
+#[wasm_bindgen_test]
+fn scoped_closure_is_closure() {
+    #[wasm_bindgen(module = "tests/wasm/closures.js")]
+    extern "C" {
+        // This function takes &Closure (which is ScopedClosure<'static, T>)
+        fn closure_with_call_closure(f: &Closure<dyn FnMut()>);
+    }
+
+    let called = Cell::new(false);
+    // Create a 'static closure using Closure::new
+    let closure = Closure::new(|| {
+        // Note: Can't capture `called` by reference here since Closure::new requires 'static
+    });
+    closure_with_call_closure(&closure);
+
+    // For non-'static captures, use ScopedClosure::borrow_mut
+    {
+        let mut func = || {
+            called.set(true);
+        };
+        let scoped = ScopedClosure::borrow_mut(&mut func);
+        closure_with_call(&scoped);
+    }
+    assert!(called.get());
+}
+
+#[wasm_bindgen(module = "tests/wasm/closures.js")]
+extern "C" {
+    // Takes ownership of the closure (passed by value)
+    fn closure_take_ownership(cb: Closure<dyn FnMut()>);
+    fn closure_take_ownership_with_arg(cb: Closure<dyn FnMut(u32)>, value: u32);
+    #[wasm_bindgen(catch)]
+    fn closure_call_stored() -> Result<(), JsValue>;
+}
+
+/// Test that Closure can be passed by value, transferring ownership to JS
+#[wasm_bindgen_test]
+fn closure_pass_by_value() {
+    use std::rc::Rc;
+
+    let called = Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+
+    // Create a closure and pass it by value to JS
+    let closure = Closure::new(move || {
+        called_clone.set(true);
+    });
+
+    // Pass ownership to JS - closure is consumed here
+    closure_take_ownership(closure);
+
+    // The closure should have been called
+    assert!(called.get());
+}
+
+/// Test that Closure passed by value with arguments works
+#[wasm_bindgen_test]
+fn closure_pass_by_value_with_arg() {
+    use std::rc::Rc;
+
+    let sum = Rc::new(Cell::new(0u32));
+    let sum_clone = sum.clone();
+
+    let closure = Closure::new(move |value: u32| {
+        sum_clone.set(sum_clone.get() + value);
+    });
+
+    closure_take_ownership_with_arg(closure, 42);
+
+    assert_eq!(sum.get(), 42);
+}
+
+/// Test that JS can store a closure passed by value and call it later
+#[wasm_bindgen_test]
+fn closure_pass_by_value_stored() {
+    use std::rc::Rc;
+
+    let called = Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+
+    // Pass closure by value - JS will store it
+    let closure = Closure::new(move || {
+        called_clone.set(true);
+    });
+    closure_take_ownership(closure);
+
+    // First call should succeed (closure was stored and called)
+    assert!(called.get());
+
+    // JS can call the stored closure again
+    let result = closure_call_stored();
+    assert!(result.is_ok(), "calling stored closure should work");
+}
+
+#[wasm_bindgen(module = "tests/wasm/closures.js")]
+extern "C" {
+    fn closure_fn_with_call(f: &ScopedClosure<dyn Fn()>);
+    fn closure_fn_with_call_arg(f: &ScopedClosure<dyn Fn(u32)>, value: u32);
+}
+
+/// Test that ScopedClosure::borrow works for Fn closures
+#[wasm_bindgen_test]
+fn scoped_closure_borrow_fn() {
+    let called = Cell::new(false);
+    {
+        let func = || {
+            called.set(true);
+        };
+        let closure = ScopedClosure::borrow(&func);
+        closure_fn_with_call(&closure);
+    }
+    assert!(called.get());
+}
+
+/// Test that ScopedClosure::borrow can capture non-'static references (Fn)
+#[wasm_bindgen_test]
+fn scoped_closure_borrow_fn_captures_non_static() {
+    let data = vec![1, 2, 3, 4, 5];
+    let sum = Cell::new(0u32);
+    {
+        let func = || {
+            // Read-only access to captured data
+            sum.set(data.iter().sum());
+        };
+        let closure = ScopedClosure::borrow(&func);
+        closure_fn_with_call(&closure);
+    }
+    assert_eq!(sum.get(), 15);
+    // data is still accessible after closure is dropped
+    assert_eq!(data.len(), 5);
+}
+
+/// Test that ScopedClosure::borrow works with arguments
+#[wasm_bindgen_test]
+fn scoped_closure_borrow_fn_with_arg() {
+    let received = Cell::new(0u32);
+    {
+        let func = |value: u32| {
+            received.set(value);
+        };
+        let closure = ScopedClosure::borrow(&func);
+        closure_fn_with_call_arg(&closure, 42);
+    }
+    assert_eq!(received.get(), 42);
+}
+
+/// Test that ScopedClosure::own works the same as Closure::new
+#[wasm_bindgen_test]
+fn scoped_closure_own() {
+    use std::rc::Rc;
+
+    let called = Rc::new(Cell::new(false));
+    let called_clone = called.clone();
+
+    // Use ScopedClosure::own instead of Closure::new
+    let closure = ScopedClosure::own(move || {
+        called_clone.set(true);
+    });
+
+    closure_take_ownership(closure);
+    assert!(called.get());
+}
+
+/// Test that ScopedClosure::borrow_mut_aborting works
+#[wasm_bindgen_test]
+#[allow(deprecated)]
+fn scoped_closure_borrow_mut_aborting() {
+    use std::rc::Rc;
+
+    // Rc<Cell<T>> is not UnwindSafe, so we need _aborting variant
+    let counter = Rc::new(Cell::new(0u32));
+    {
+        let mut func = || {
+            counter.set(counter.get() + 1);
+        };
+        let closure = ScopedClosure::borrow_mut_aborting(&mut func);
+        closure_with_call(&closure);
+        closure_with_call(&closure);
+    }
+    assert_eq!(counter.get(), 2);
+}
+
+/// Test that ScopedClosure::borrow_aborting works
+#[wasm_bindgen_test]
+fn scoped_closure_borrow_aborting() {
+    use std::rc::Rc;
+
+    // Rc<Cell<T>> is not UnwindSafe, so we need _aborting variant
+    let counter = Rc::new(Cell::new(0u32));
+    {
+        let func = || {
+            counter.set(counter.get() + 1);
+        };
+        let closure = ScopedClosure::borrow_aborting(&func);
+        closure_fn_with_call(&closure);
+        closure_fn_with_call(&closure);
+    }
+    assert_eq!(counter.get(), 2);
 }

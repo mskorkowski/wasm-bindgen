@@ -63,7 +63,13 @@ fn args_are_optional(name: &str) -> bool {
 pub fn interface(module: &Module) -> Result<String, Error> {
     let mut exports = String::new();
     module_export_types(module, |name, ty| {
-        writeln!(exports, "  readonly {name}: {ty};").unwrap();
+        if name.contains(':') {
+            // This can happen when `name` is namespaced, like `__wbgt__reference_test::foo`.
+            // We should quote the name, as : is not valid in TypeScript identifiers.
+            writeln!(exports, "  readonly {name:?}: {ty};").unwrap();
+        } else {
+            writeln!(exports, "  readonly {name}: {ty};").unwrap();
+        }
     });
     Ok(exports)
 }
@@ -90,6 +96,7 @@ fn module_export_types(module: &Module, mut export: impl FnMut(&str, &str)) {
             walrus::ExportItem::Memory(_) => export(&entry.name, "WebAssembly.Memory"),
             walrus::ExportItem::Table(_) => export(&entry.name, "WebAssembly.Table"),
             walrus::ExportItem::Global(_) => continue,
+            walrus::ExportItem::Tag(_) => export(&entry.name, "WebAssembly.Tag"),
         };
     }
 }
@@ -177,10 +184,10 @@ impl Output {
             push_index_identifier(set.len(), &mut name);
 
             js_imports.push_str(&format!(
-                "import * as import_{} from '{}';\n",
-                name, entry.module
+                "import * as import_{name} from '{}';\n",
+                entry.module
             ));
-            imports.push_str(&format!("'{}': import_{}, ", entry.module, name));
+            imports.push_str(&format!("'{}': import_{name}, ", entry.module));
         }
 
         for entry in self.module.exports.iter() {

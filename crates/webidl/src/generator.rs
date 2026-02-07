@@ -1,11 +1,10 @@
+use crate::util::{camel_case_ident, leading_colon_path_ty, raw_ident, rust_ident};
 use proc_macro2::Literal;
 use proc_macro2::TokenStream;
 use quote::format_ident;
 use quote::quote;
 use std::collections::BTreeSet;
 use syn::{Ident, Type};
-use wasm_bindgen_backend::util::leading_colon_path_ty;
-use wasm_bindgen_backend::util::{raw_ident, rust_ident};
 
 use crate::constants::{BUILTIN_IDENTS, POLYFILL_INTERFACES};
 use crate::idl_type::IdlType;
@@ -57,7 +56,7 @@ fn maybe_unstable_docs(unstable: bool) -> Option<proc_macro2::TokenStream> {
         Some(quote! {
             #[doc = ""]
             #[doc = "*This API is unstable and requires `--cfg=web_sys_unstable_apis` to be activated, as"]
-            #[doc = "[described in the `wasm-bindgen` guide](https://rustwasm.github.io/docs/wasm-bindgen/web-sys/unstable-apis.html)*"]
+            #[doc = "[described in the `wasm-bindgen` guide](https://wasm-bindgen.github.io/wasm-bindgen/web-sys/unstable-apis.html)*"]
         })
     } else {
         None
@@ -244,6 +243,10 @@ pub struct InterfaceAttribute {
     pub catch: bool,
     pub kind: InterfaceAttributeKind,
     pub unstable: bool,
+    /// True if this is a stable attribute that has an unstable override with
+    /// the same name but different type. When true, this attribute is gated
+    /// behind `#[cfg(not(web_sys_unstable_apis))]`.
+    pub has_unstable_override: bool,
 }
 
 impl InterfaceAttribute {
@@ -265,10 +268,24 @@ impl InterfaceAttribute {
             catch,
             kind,
             unstable,
+            has_unstable_override,
         } = self;
 
-        let unstable_attr = maybe_unstable_attr(*unstable);
-        let unstable_docs = maybe_unstable_docs(*unstable);
+        // If this is a stable attribute that has an unstable override,
+        // gate it behind `not(web_sys_unstable_apis)` so it's excluded
+        // when the unstable version is enabled.
+        let unstable_attr = if *has_unstable_override {
+            Some(quote! {
+                #[cfg(not(web_sys_unstable_apis))]
+            })
+        } else {
+            maybe_unstable_attr(*unstable)
+        };
+        let unstable_docs = if *has_unstable_override {
+            None
+        } else {
+            maybe_unstable_docs(*unstable)
+        };
 
         let mdn_docs = mdn_doc(parent_js_name, Some(js_name));
 
@@ -431,9 +448,8 @@ impl InterfaceMethod<'_> {
                     extra_args[0] = quote!( js_class = #name );
                 }
                 format!(
-                    "The `new {}(..)` constructor, creating a new \
-                     instance of `{0}`.\n\n{}",
-                    parent_name,
+                    "The `new {parent_name}(..)` constructor, creating a new \
+                     instance of `{parent_name}`.\n\n{}",
                     mdn_doc(&parent_js_name, Some(&parent_js_name))
                 )
             }
@@ -448,8 +464,7 @@ impl InterfaceMethod<'_> {
                     js_name
                 };
                 format!(
-                    "The `{}()` method.\n\n{}",
-                    js_name,
+                    "The `{js_name}()` method.\n\n{}",
                     mdn_doc(&parent_js_name, Some(method))
                 )
             }
@@ -579,7 +594,7 @@ impl Interface<'_> {
         let unstable_docs = maybe_unstable_docs(*unstable);
 
         let doc_comment = comment(
-            format!("The `{}` class.\n\n{}", name, mdn_doc(js_name, None)),
+            format!("The `{name}` class.\n\n{}", mdn_doc(js_name, None)),
             &get_features_doc(options, name.to_string()),
         );
 
@@ -925,6 +940,117 @@ impl Dictionary {
     }
 }
 
+pub enum NamespaceAttributeKind {
+    Getter,
+    /// Note: Per the WebIDL spec, namespace attributes are always readonly,
+    /// so this variant is currently unused. It's kept for potential future use
+    /// or non-standard WebIDL extensions.
+    #[allow(dead_code)]
+    Setter,
+}
+
+pub struct NamespaceAttribute {
+    pub js_name: String,
+    pub rust_name: String,
+    pub ty: Type,
+    pub catch: bool,
+    pub kind: NamespaceAttributeKind,
+    pub unstable: bool,
+}
+
+impl NamespaceAttribute {
+    fn generate(
+        &self,
+        options: &Options,
+        parent_name: &Ident,
+        ns_type_name: &Ident,
+        parent_js_name: &str,
+    ) -> TokenStream {
+        let NamespaceAttribute {
+            js_name,
+            rust_name,
+            ty,
+            catch,
+            kind,
+            unstable,
+        } = self;
+
+        let unstable_attr = maybe_unstable_attr(*unstable);
+        let unstable_docs = maybe_unstable_docs(*unstable);
+
+        let mdn_docs = mdn_doc(parent_js_name, Some(js_name));
+
+        let mut features = BTreeSet::new();
+
+        add_features(&mut features, ty);
+        features.remove(&parent_name.to_string());
+
+        let cfg_features = get_cfg_features(options, &features);
+
+        features.insert(parent_name.to_string());
+
+        let doc_comment = required_doc_string(options, &features);
+
+        let (prefix, attr, def) = match kind {
+            NamespaceAttributeKind::Getter => {
+                let rust_name = rust_ident(rust_name);
+
+                let ty = if *catch {
+                    quote!( Result<#ty, JsValue> )
+                } else {
+                    quote!( #ty )
+                };
+
+                (
+                    "Getter",
+                    quote!(getter,),
+                    quote!( pub fn #rust_name() -> #ty; ),
+                )
+            }
+
+            NamespaceAttributeKind::Setter => {
+                let rust_name = rust_ident(rust_name);
+
+                let ret_ty = if *catch {
+                    Some(quote!( -> Result<(), JsValue> ))
+                } else {
+                    None
+                };
+
+                (
+                    "Setter",
+                    quote!(setter,),
+                    quote!( pub fn #rust_name(value: #ty) #ret_ty; ),
+                )
+            }
+        };
+
+        let catch = if *catch { Some(quote!(catch,)) } else { None };
+
+        let doc_comment = comment(
+            format!("{prefix} for the `{parent_js_name}.{js_name}` field.\n\n{mdn_docs}"),
+            &doc_comment,
+        );
+
+        let js_name_ident = raw_ident(js_name);
+
+        quote! {
+            #unstable_attr
+            #cfg_features
+            #[wasm_bindgen(
+                #catch
+                static_method_of = #ns_type_name,
+                js_class = #parent_js_name,
+                #attr
+                js_name = #js_name_ident
+            )]
+            #doc_comment
+            #unstable_docs
+            #def
+        }
+    }
+}
+
 pub struct Function<'a> {
     pub name: Ident,
     pub js_name: String,
@@ -958,9 +1084,7 @@ impl Function<'_> {
         let js_namespace = raw_ident(&parent_js_name);
 
         let doc_comment = format!(
-            "The `{}.{}()` function.\n\n{}",
-            parent_js_name,
-            js_name,
+            "The `{parent_js_name}.{js_name}()` function.\n\n{}",
             mdn_doc(&parent_js_name, Some(js_name))
         );
 
@@ -1020,6 +1144,7 @@ pub struct Namespace<'a> {
     pub name: Ident,
     pub js_name: String,
     pub consts: Vec<Const>,
+    pub attributes: Vec<NamespaceAttribute>,
     pub functions: Vec<Function<'a>>,
     pub unstable: bool,
 }
@@ -1030,6 +1155,7 @@ impl Namespace<'_> {
             name,
             js_name,
             consts,
+            attributes,
             functions,
             unstable,
         } = self;
@@ -1042,12 +1168,36 @@ impl Namespace<'_> {
             .map(|x| x.generate(options, name, js_name.to_string()))
             .collect::<Vec<_>>();
 
-        let functions = if functions.is_empty() {
+        // For namespace attributes, we need a type binding that represents the namespace
+        // so we can use static_method_of to access properties on it
+        let ns_type_name = rust_ident(&format!("JsNamespace{}", camel_case_ident(js_name)));
+        let js_namespace = raw_ident(js_name);
+
+        let attributes = attributes
+            .iter()
+            .map(|x| x.generate(options, name, &ns_type_name, js_name))
+            .collect::<Vec<_>>();
+
+        // Only generate the namespace type if we have attributes that need it
+        let ns_type_binding = if attributes.is_empty() {
             None
         } else {
             Some(quote! {
                 #[wasm_bindgen]
                 extern "C" {
+                    #[wasm_bindgen(js_name = #js_namespace)]
+                    pub type #ns_type_name;
+                }
+            })
+        };
+
+        let extern_block = if functions.is_empty() && attributes.is_empty() {
+            None
+        } else {
+            Some(quote! {
+                #[wasm_bindgen]
+                extern "C" {
+                    #(#attributes)*
                     #(#functions)*
                 }
             })
@@ -1069,7 +1219,9 @@ impl Namespace<'_> {
 
                 #(#consts)*
 
-                #functions
+                #ns_type_binding
+
+                #extern_block
             }
         }
     }

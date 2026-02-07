@@ -96,10 +96,12 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::fmt::{self, Display};
 use core::future::Future;
+use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
 use core::task::{self, Poll};
 use js_sys::{Array, Function, Promise};
 pub use wasm_bindgen;
+
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -112,9 +114,19 @@ use wasm_bindgen_futures::future_to_promise;
 const CONCURRENCY: usize = 1;
 
 pub mod browser;
+
+/// A modified `criterion.rs`, retaining only the basic benchmark capabilities.
+#[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+pub mod criterion;
 pub mod detect;
 pub mod node;
 mod scoped_tls;
+/// Directly depending on wasm-bindgen-test-based libraries should be avoided,
+/// as it creates a circular dependency that breaks their usage within `wasm-bindgen-test`.
+///
+/// Let's copy web-time.
+#[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+pub(crate) mod web_time;
 pub mod worker;
 
 /// Runtime test harness support instantiated in JS.
@@ -127,6 +139,9 @@ pub struct Context {
 }
 
 struct State {
+    /// In Benchmark
+    is_bench: bool,
+
     /// Include ignored tests.
     include_ignored: Cell<bool>,
 
@@ -226,7 +241,11 @@ trait Formatter {
     fn writeln(&self, line: &str);
 
     /// Log the result of a test, either passing or failing.
-    fn log_test(&self, name: &str, result: &TestResult);
+    fn log_test(&self, is_bench: bool, name: &str, result: &TestResult) {
+        if !is_bench {
+            self.writeln(&format!("test {} ... {}", name, result));
+        }
+    }
 
     /// Convert a thrown value into a string, using platform-specific apis
     /// perhaps to turn the error into a string.
@@ -278,13 +297,17 @@ impl Context {
     /// coordinated, and this will collect output and results for all executed
     /// tests.
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Context {
+    pub fn new(is_bench: bool) -> Context {
         fn panic_handling(mut message: String) {
-            let should_panic = CURRENT_OUTPUT.with(|output| {
-                let mut output = output.borrow_mut();
-                output.panic.push_str(&message);
-                output.should_panic
-            });
+            let should_panic = if !CURRENT_OUTPUT.is_set() {
+                false
+            } else {
+                CURRENT_OUTPUT.with(|output| {
+                    let mut output = output.borrow_mut();
+                    output.panic.push_str(&message);
+                    output.should_panic
+                })
+            };
 
             // See https://github.com/rustwasm/console_error_panic_hook/blob/4dc30a5448ed3ffcfb961b1ad54d000cca881b84/src/lib.rs#L83-L123.
             if !should_panic {
@@ -301,8 +324,7 @@ impl Context {
 
                 message.push_str("\n\nStack:\n\n");
                 let e = Error::new();
-                let stack = e.stack();
-                message.push_str(&stack);
+                message.push_str(&e.stack());
 
                 message.push_str("\n\n");
 
@@ -317,15 +339,11 @@ impl Context {
                 panic_handling(panic_info.to_string());
             }));
         });
-        #[cfg(all(
-            not(feature = "std"),
-            target_arch = "wasm32",
-            any(target_os = "unknown", target_os = "none")
-        ))]
+        #[cfg(not(feature = "std"))]
         #[panic_handler]
         fn panic_handler(panic_info: &core::panic::PanicInfo<'_>) -> ! {
             panic_handling(panic_info.to_string());
-            core::arch::wasm32::unreachable();
+            unreachable!();
         }
 
         let formatter = match detect::detect() {
@@ -338,6 +356,7 @@ impl Context {
 
         Context {
             state: Rc::new(State {
+                is_bench,
                 include_ignored: Default::default(),
                 failures: Default::default(),
                 succeeded_count: Default::default(),
@@ -371,10 +390,12 @@ impl Context {
     /// The promise returned resolves to either `true` if all tests passed or
     /// `false` if at least one test failed.
     pub fn run(&self, tests: Vec<JsValue>) -> Promise {
-        let noun = if tests.len() == 1 { "test" } else { "tests" };
-        self.state
-            .formatter
-            .writeln(&format!("running {} {}", tests.len(), noun));
+        if !self.state.is_bench {
+            let noun = if tests.len() == 1 { "test" } else { "tests" };
+            self.state
+                .formatter
+                .writeln(&format!("running {} {}", tests.len(), noun));
+        }
 
         // Execute all our test functions through their Wasm shims (unclear how
         // to pass native function pointers around here). Each test will
@@ -396,7 +417,7 @@ impl Context {
         // Now that we've collected all our tests we wrap everything up in a
         // future to actually do all the processing, and pass it out to JS as a
         // `Promise`.
-        let state = self.state.clone();
+        let state = AssertUnwindSafe(self.state.clone());
         future_to_promise(async {
             let passed = ExecuteTests(state).await;
             Ok(JsValue::from(passed))
@@ -525,14 +546,16 @@ impl Context {
         ignore: Option<Option<&'static str>>,
     ) {
         // Remove the crate name to mimic libtest more closely.
-        // This also removes our `__wbgt_` prefix and the `ignored` and `should_panic` modifiers.
+        // This also removes our `__wbgt_` or `__wbgb_` prefix and the `ignored` and `should_panic` modifiers.
         let name = name.split_once("::").unwrap().1;
 
         if let Some(ignore) = ignore {
             if !self.state.include_ignored.get() {
-                self.state
-                    .formatter
-                    .log_test(name, &TestResult::Ignored(ignore.map(str::to_owned)));
+                self.state.formatter.log_test(
+                    self.state.is_bench,
+                    name,
+                    &TestResult::Ignored(ignore.map(str::to_owned)),
+                );
                 let ignored = self.state.ignored_count.get();
                 self.state.ignored_count.set(ignored + 1);
                 return;
@@ -559,7 +582,7 @@ impl Context {
     }
 }
 
-struct ExecuteTests(Rc<State>);
+struct ExecuteTests(AssertUnwindSafe<Rc<State>>);
 
 impl Future for ExecuteTests {
     type Output = bool;
@@ -588,6 +611,8 @@ impl Future for ExecuteTests {
                 Some(test) => test,
                 None => break,
             };
+            // Output test invocation log for debugging failures with --nocapture
+            console_log!("Invoking test: {}", test.name);
             let result = match test.future.as_mut().poll(cx) {
                 Poll::Ready(result) => result,
                 Poll::Pending => {
@@ -622,8 +647,11 @@ impl State {
             if let TestResult::Err(_e) = result {
                 if let Some(expected) = should_panic {
                     if !test.output.borrow().panic.contains(expected) {
-                        self.formatter
-                            .log_test(&test.name, &TestResult::Err(JsValue::NULL));
+                        self.formatter.log_test(
+                            self.is_bench,
+                            &test.name,
+                            &TestResult::Err(JsValue::NULL),
+                        );
                         self.failures
                             .borrow_mut()
                             .push((test, Failure::ShouldPanicExpected));
@@ -631,17 +659,18 @@ impl State {
                     }
                 }
 
-                self.formatter.log_test(&test.name, &TestResult::Ok);
+                self.formatter
+                    .log_test(self.is_bench, &test.name, &TestResult::Ok);
                 self.succeeded_count.set(self.succeeded_count.get() + 1);
             } else {
                 self.formatter
-                    .log_test(&test.name, &TestResult::Err(JsValue::NULL));
+                    .log_test(self.is_bench, &test.name, &TestResult::Err(JsValue::NULL));
                 self.failures
                     .borrow_mut()
                     .push((test, Failure::ShouldPanic));
             }
         } else {
-            self.formatter.log_test(&test.name, &result);
+            self.formatter.log_test(self.is_bench, &test.name, &result);
 
             match result {
                 TestResult::Ok => self.succeeded_count.set(self.succeeded_count.get() + 1),
@@ -769,7 +798,7 @@ struct TestFuture<F> {
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(catch)]
-    fn __wbg_test_invoke(f: &mut dyn FnMut()) -> Result<(), JsValue>;
+    fn __wbg_test_invoke(f: &ScopedClosure<dyn FnMut()>) -> Result<(), JsValue>;
 }
 
 impl<F: Future<Output = Result<(), JsValue>>> Future for TestFuture<F> {
@@ -779,14 +808,16 @@ impl<F: Future<Output = Result<(), JsValue>>> Future for TestFuture<F> {
         let output = self.output.clone();
         // Use `new_unchecked` here to project our own pin, and we never
         // move `test` so this should be safe
-        let test = unsafe { Pin::map_unchecked_mut(self, |me| &mut me.test) };
+        let test: Pin<&mut F> = unsafe { Pin::map_unchecked_mut(self, |me| &mut me.test) };
         let mut future_output = None;
         let result = CURRENT_OUTPUT.set(&output, || {
             let mut test = Some(test);
-            __wbg_test_invoke(&mut || {
+            let mut func = || {
                 let test = test.take().unwrap_throw();
                 future_output = Some(test.poll(cx))
-            })
+            };
+            let closure = ScopedClosure::borrow_mut(&mut func);
+            __wbg_test_invoke(&closure)
         });
         match (result, future_output) {
             (_, Some(Poll::Ready(result))) => Poll::Ready(result),
